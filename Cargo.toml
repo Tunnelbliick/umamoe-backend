@@ -1,0 +1,42 @@
+[package]
+name = "honsemoe-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.6"
+tower = "0.4"
+tower-http = { version = "0.4", features = ["cors", "trace", "fs"] }
+tokio = { version = "1.0", features = ["full"] }
+
+# Database
+sqlx = { version = "0.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "migrate", "json", "offline"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Validation
+validator = { version = "0.16", features = ["derive"] }
+
+# Rate limiting and bot protection
+tower_governor = "0.1"
+governor = "0.6"
+dashmap = "5.5"
+
+# Environment
+dotenvy = "0.15"
+
+# HTTP client (for external API calls if needed)
+reqwest = { version = "0.11", features = ["json"] }
