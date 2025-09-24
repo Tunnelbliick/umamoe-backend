@@ -42,12 +42,12 @@ struct TurnstileVerifyResponse {
 
 const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
-pub async fn turnstile_verification_middleware<B>(
+pub async fn turnstile_verification_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     method: Method,
-    request: axum::http::Request<B>,
-    next: Next<B>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
 ) -> Result<Response, StatusCode> {
     // Only verify POST requests
     if method != Method::POST {

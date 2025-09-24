@@ -173,9 +173,9 @@ async fn main() -> anyhow::Result<()> {
     
     info!("🚀 Server starting on http://{}:{}", host, port);
 
-    // Start the server using the axum Server API
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+    // Start the server using tokio and axum listener
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
 
     Ok(())

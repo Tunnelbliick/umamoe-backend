@@ -5,13 +5,13 @@ edition = "2021"
 
 [dependencies]
 # Web framework
-axum = "0.6"
-tower = "0.4"
-tower-http = { version = "0.4", features = ["cors", "trace", "fs"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokio = { version = "1.0", features = ["full"] }
 
 # Database
-sqlx = { version = "0.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "migrate", "json", "offline"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "migrate", "json"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -28,15 +28,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Validation
-validator = { version = "0.16", features = ["derive"] }
+validator = { version = "0.18", features = ["derive"] }
 
 # Rate limiting and bot protection
-tower_governor = "0.1"
+tower_governor = "0.4"
 governor = "0.6"
-dashmap = "5.5"
+dashmap = "6.0"
 
 # Environment
 dotenvy = "0.15"
 
 # HTTP client (for external API calls if needed)
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
