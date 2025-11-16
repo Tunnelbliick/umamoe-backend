@@ -1,4 +1,5 @@
 // Re-export all model types from submodules
+mod circles;
 mod common;
 mod inheritance;
 mod search;
@@ -8,6 +9,7 @@ mod support_cards;
 mod tasks;
 
 // Re-export everything from each module except common (items from common are imported directly where needed)
+pub use circles::*;
 pub use inheritance::*;
 pub use search::*;
 pub use sharing::*;

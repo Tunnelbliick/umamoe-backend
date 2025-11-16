@@ -47,7 +47,7 @@ pub async fn turnstile_verification_middleware(
     headers: HeaderMap,
     method: Method,
     request: axum::http::Request<axum::body::Body>,
-    next: Next,
+    next: Next<axum::body::Body>,
 ) -> Result<Response, StatusCode> {
     // Only verify POST requests
     if method != Method::POST {

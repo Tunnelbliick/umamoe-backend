@@ -15,6 +15,9 @@ pub enum AppError {
     
     #[error("Bad request: {0}")]
     BadRequest(String),
+    
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 impl IntoResponse for AppError {
@@ -29,6 +32,7 @@ impl IntoResponse for AppError {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg.as_str())
             }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
         };
 
         let body = Json(json!({

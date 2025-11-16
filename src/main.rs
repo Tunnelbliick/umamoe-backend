@@ -20,7 +20,7 @@ mod database;
 mod errors;
 mod middleware;
 
-use handlers::{search, stats, tasks, sharing};
+use handlers::{circles, search, stats, tasks, sharing};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -145,14 +145,23 @@ async fn main() -> anyhow::Result<()> {
     ]);
 
     // Build the application with proper routing and middleware
-    let app = Router::new()
-        .route("/api/health", get(health_check)) // Health check under /api
+    // Public endpoints (no Turnstile, permissive CORS)
+    let public_routes = Router::new()
+        .nest("/api/circles", circles::router())
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(CorsLayer::permissive()) // Allow all origins for public API
+        )
+        .with_state(state.clone());
+
+    // Protected endpoints (Turnstile + restricted CORS)
+    let protected_routes = Router::new()
+        .route("/api/health", get(health_check))
         .nest("/api/stats", stats::router())
         .nest("/api/tasks", tasks::router())
-        .nest("/api/v3/tasks", tasks::router()) // fall back cause tasks server sucks apparently
-        // V3 search endpoint (consolidated from v1/v2)
+        .nest("/api/v3/tasks", tasks::router())
         .nest("/api/v3", search::router())
-        // Sharing routes (no /api prefix for direct access)
         .nest("/", sharing::router())
         .layer(
             ServiceBuilder::new()
@@ -161,6 +170,9 @@ async fn main() -> anyhow::Result<()> {
                 .layer(cors)
         )
         .with_state(state);
+
+    // Merge public and protected routes
+    let app = public_routes.merge(protected_routes);
 
     // Server configuration
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -173,9 +185,9 @@ async fn main() -> anyhow::Result<()> {
     
     info!("🚀 Server starting on http://{}:{}", host, port);
 
-    // Start the server using tokio and axum listener
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+    // Start the server - compatible with both Axum 0.6 and 0.7
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
 
     Ok(())
@@ -191,6 +203,7 @@ async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
             "search": "/api/v3/search",
             "stats": "/api/stats", 
             "tasks": "/api/tasks",
+            "circles": "/api/circles",
             "health": "/api/health"
         }
     })))
