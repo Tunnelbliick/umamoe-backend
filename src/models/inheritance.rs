@@ -1,9 +1,8 @@
+use crate::models::common::{Factor, SkillFactor};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc, NaiveDateTime};
 use sqlx::FromRow;
-use validator::Validate;
 use uuid::Uuid;
-use crate::models::common::{Factor, SkillFactor, deserialize_comma_separated_ints};
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct InheritanceRecord {
@@ -70,6 +69,8 @@ pub struct Inheritance {
     pub main_green_factors: i32,
     pub main_white_factors: Vec<i32>,
     pub main_white_count: i32,
+    #[sqlx(default)]
+    pub affinity_score: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,7 +82,6 @@ pub struct InheritanceWithTrainer {
     pub last_updated: Option<NaiveDateTime>,
     pub support_cards: Vec<super::support_cards::SupportCard>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InheritanceMetaData {

@@ -1,21 +1,20 @@
 use axum::{
     extract::{Path, State},
-    response::{Html, Response, IntoResponse},
+    http::{HeaderMap, HeaderValue},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Router,
-    http::{HeaderMap, HeaderValue},
 };
 use sqlx::Row;
 
 use crate::{
     errors::Result,
-    models::{SharePathParams, InheritanceShareData, SupportCardShareData},
+    models::{InheritanceShareData, SharePathParams, SupportCardShareData},
     AppState,
 };
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/s/:share_type/:account_id", get(share_page))
+    Router::new().route("/s/:share_type/:account_id", get(share_page))
 }
 
 pub async fn share_page(
@@ -27,7 +26,10 @@ pub async fn share_page(
         "support-card" => support_card_share(&state, &params.account_id).await,
         _ => {
             // Return a 404 for unknown share types
-            let html = generate_error_html("Invalid share type", "The requested share type is not supported.");
+            let html = generate_error_html(
+                "Invalid share type",
+                "The requested share type is not supported.",
+            );
             Ok(Html(html).into_response())
         }
     }
@@ -69,7 +71,10 @@ async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Respons
     {
         Some(row) => row,
         None => {
-            let html = generate_error_html("Inheritance Not Found", "The requested inheritance record could not be found.");
+            let html = generate_error_html(
+                "Inheritance Not Found",
+                "The requested inheritance record could not be found.",
+            );
             return Ok(Html(html).into_response());
         }
     };
@@ -105,8 +110,11 @@ async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Respons
     let white_factors_summary = format_sparks_summary(&white_sparks, "white");
     let main_factors_summary = format!(
         "Blue: {} • Pink: {} • Green: {} • White: {} ({})",
-        main_blue_factors, main_pink_factors, main_green_factors, 
-        format_sparks_summary(&main_white_factors, "white"), main_white_count
+        main_blue_factors,
+        main_pink_factors,
+        main_green_factors,
+        format_sparks_summary(&main_white_factors, "white"),
+        main_white_count
     );
 
     let share_data = InheritanceShareData {
@@ -127,11 +135,14 @@ async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Respons
     };
 
     let html = generate_inheritance_html(&share_data);
-    
+
     // Set proper headers for HTML response
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("text/html; charset=utf-8"));
-    
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+
     Ok((headers, Html(html)).into_response())
 }
 
@@ -158,7 +169,10 @@ async fn support_card_share(state: &AppState, account_id: &str) -> Result<Respon
     {
         Some(row) => row,
         None => {
-            let html = generate_error_html("Support Card Not Found", "The requested support card record could not be found.");
+            let html = generate_error_html(
+                "Support Card Not Found",
+                "The requested support card record could not be found.",
+            );
             return Ok(Html(html).into_response());
         }
     };
@@ -182,24 +196,35 @@ async fn support_card_share(state: &AppState, account_id: &str) -> Result<Respon
     };
 
     let html = generate_support_card_html(&share_data);
-    
+
     // Set proper headers for HTML response
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("text/html; charset=utf-8"));
-    
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+
     Ok((headers, Html(html)).into_response())
 }
 
 fn generate_inheritance_html(data: &InheritanceShareData) -> String {
-    let title = format!("{}'s {} Inheritance", data.trainer_name, data.character_name);
+    let title = format!(
+        "{}'s {} Inheritance",
+        data.trainer_name, data.character_name
+    );
     let description = format!(
         "Parents: {} × {} • Rank: {} • Rarity: {} • Wins: {} • White Skills: {} • {}",
-        data.parent_left_name, data.parent_right_name, 
-        get_rank_display(data.parent_rank), get_rarity_display(data.parent_rarity),
-        data.win_count, data.white_count, data.main_factors_summary
+        data.parent_left_name,
+        data.parent_right_name,
+        get_rank_display(data.parent_rank),
+        get_rarity_display(data.parent_rarity),
+        data.win_count,
+        data.white_count,
+        data.main_factors_summary
     );
 
-    let html = format!("<!DOCTYPE html>
+    let html = format!(
+        "<!DOCTYPE html>
 <html lang=\"en\">
 <head>
     <meta charset=\"UTF-8\">
@@ -325,12 +350,25 @@ fn generate_inheritance_html(data: &InheritanceShareData) -> String {
     </div>
 </body>
 </html>",
-        title, title, description, data.account_id, title, description, data.account_id,
-        data.character_name, data.trainer_name, data.parent_left_name, data.parent_right_name,
-        get_rank_display(data.parent_rank), get_rarity_display(data.parent_rarity),
-        data.win_count, data.white_count,
-        data.blue_factors_summary, data.pink_factors_summary, 
-        data.green_factors_summary, data.white_factors_summary,
+        title,
+        title,
+        description,
+        data.account_id,
+        title,
+        description,
+        data.account_id,
+        data.character_name,
+        data.trainer_name,
+        data.parent_left_name,
+        data.parent_right_name,
+        get_rank_display(data.parent_rank),
+        get_rarity_display(data.parent_rarity),
+        data.win_count,
+        data.white_count,
+        data.blue_factors_summary,
+        data.pink_factors_summary,
+        data.green_factors_summary,
+        data.white_factors_summary,
         data.main_factors_summary
     );
     html
@@ -344,11 +382,11 @@ fn generate_support_card_html(data: &SupportCardShareData) -> String {
     };
     let description = format!(
         "{} {} • {} • Experience: {} • Trainer: {}",
-        data.card_rarity, data.card_name, limit_break_display, 
-        data.experience, data.trainer_name
+        data.card_rarity, data.card_name, limit_break_display, data.experience, data.trainer_name
     );
 
-    let html = format!("<!DOCTYPE html>
+    let html = format!(
+        "<!DOCTYPE html>
 <html lang=\"en\">
 <head>
     <meta charset=\"UTF-8\">
@@ -454,15 +492,26 @@ fn generate_support_card_html(data: &SupportCardShareData) -> String {
     </div>
 </body>
 </html>",
-        title, title, description, data.account_id, title, description, data.account_id,
-        data.card_name, data.trainer_name, data.card_rarity, 
-        limit_break_display, data.experience, data.card_type
+        title,
+        title,
+        description,
+        data.account_id,
+        title,
+        description,
+        data.account_id,
+        data.card_name,
+        data.trainer_name,
+        data.card_rarity,
+        limit_break_display,
+        data.experience,
+        data.card_type
     );
     html
 }
 
 fn generate_error_html(title: &str, message: &str) -> String {
-    format!("<!DOCTYPE html>
+    format!(
+        "<!DOCTYPE html>
 <html lang=\"en\">
 <head>
     <meta charset=\"UTF-8\">
@@ -519,7 +568,9 @@ fn generate_error_html(title: &str, message: &str) -> String {
         </div>
     </div>
 </body>
-</html>", title, title, message)
+</html>",
+        title, title, message
+    )
 }
 
 // Helper functions for mapping IDs to names (you'll need to implement these)
@@ -632,7 +683,7 @@ fn get_support_card_details(support_card_id: i32) -> (String, String, String) {
         _ => (
             format!("Support Card {}", support_card_id),
             "★★★".to_string(),
-            "Speed".to_string()
+            "Speed".to_string(),
         ),
     }
 }
@@ -666,25 +717,25 @@ fn format_sparks_summary(sparks: &[i32], _spark_type: &str) -> String {
     if sparks.is_empty() {
         return "None".to_string();
     }
-    
+
     // Group sparks by factor type and count levels
     use std::collections::HashMap;
     let mut factor_counts: HashMap<i32, Vec<i32>> = HashMap::new();
-    
+
     for &spark in sparks {
         let factor_id = spark / 10;
         let level = spark % 10;
         factor_counts.entry(factor_id).or_default().push(level);
     }
-    
+
     let mut summary_parts: Vec<String> = Vec::new();
-    
+
     for (factor_id, levels) in factor_counts {
         let factor_name = get_factor_name(factor_id);
         let max_level = levels.iter().max().unwrap_or(&0);
         summary_parts.push(format!("{} ★{}", factor_name, max_level));
     }
-    
+
     if summary_parts.is_empty() {
         "None".to_string()
     } else {
@@ -700,7 +751,7 @@ fn get_factor_name(factor_id: i32) -> String {
         3 => "Power".to_string(),
         4 => "Guts".to_string(),
         5 => "Wit".to_string(),
-        
+
         // Pink factors (aptitudes)
         10 => "Turf".to_string(),
         11 => "Dirt".to_string(),
@@ -712,14 +763,14 @@ fn get_factor_name(factor_id: i32) -> String {
         17 => "Pace Chaser".to_string(),
         18 => "Late Surger".to_string(),
         19 => "End".to_string(),
-        
+
         // Green factors (resistance)
         20 => "Summer".to_string(),
         21 => "Heavy".to_string(),
-        
+
         // White factors (skills) - simplified
         _ if factor_id >= 30 => format!("Skill {}", factor_id - 29),
-        
+
         _ => format!("Factor {}", factor_id),
     }
 }

@@ -1,11 +1,11 @@
-use serde::{Deserialize, Serialize};
+use crate::models::common::deserialize_vec_string_from_query;
 use chrono::NaiveDateTime;
-use crate::models::common::deserialize_comma_separated_ints;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse<T> {
     pub items: Vec<T>,
-    pub total: i64,
+    pub total: String,
     pub page: i64,
     pub limit: i64,
     pub total_pages: i64,
@@ -20,7 +20,7 @@ pub struct UnifiedSearchParams {
     pub limit: Option<i64>,
     #[serde(default)]
     pub search_type: Option<String>, // "inheritance", "support_cards", or "all" (default)
-    
+
     // Inheritance filtering
     #[serde(default)]
     pub main_parent_id: Option<i32>,
@@ -32,14 +32,30 @@ pub struct UnifiedSearchParams {
     pub parent_rank: Option<i32>,
     #[serde(default)]
     pub parent_rarity: Option<i32>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated_ints")]
-    pub blue_sparks: Option<Vec<i32>>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated_ints")]
-    pub pink_sparks: Option<Vec<i32>>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated_ints")]
-    pub green_sparks: Option<Vec<i32>>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated_ints")]
-    pub white_sparks: Option<Vec<i32>>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub blue_sparks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub pink_sparks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub green_sparks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub white_sparks: Vec<String>,
+    // 9-star spark filtering (searches across all stat types)
+    #[serde(default)]
+    pub blue_sparks_9star: Option<bool>,
+    #[serde(default)]
+    pub pink_sparks_9star: Option<bool>,
+    #[serde(default)]
+    pub green_sparks_9star: Option<bool>,
+    // Main parent spark filtering
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub main_parent_blue_sparks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub main_parent_pink_sparks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub main_parent_green_sparks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub main_parent_white_sparks: Vec<String>,
     #[serde(default)]
     pub min_win_count: Option<i32>,
     #[serde(default)]
@@ -51,11 +67,11 @@ pub struct UnifiedSearchParams {
     pub min_main_pink_factors: Option<i32>,
     #[serde(default)]
     pub min_main_green_factors: Option<i32>,
-    #[serde(default, deserialize_with = "deserialize_comma_separated_ints")]
-    pub main_white_factors: Option<Vec<i32>>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub main_white_factors: Vec<String>,
     #[serde(default)]
     pub min_main_white_count: Option<i32>,
-    
+
     // Support card filtering
     #[serde(default)]
     pub support_card_id: Option<i32>,
@@ -65,14 +81,28 @@ pub struct UnifiedSearchParams {
     pub max_limit_break: Option<i32>,
     #[serde(default)]
     pub min_experience: Option<i32>,
-    
+
     // Common filtering
     #[serde(default)]
     pub trainer_id: Option<String>, // Direct trainer ID lookup
     #[serde(default)]
+    pub trainer_name: Option<String>, // Trainer name search
+    #[serde(default)]
     pub max_follower_num: Option<i32>,
     #[serde(default)]
     pub sort_by: Option<String>,
+    #[serde(default)]
+    pub sort_order: Option<String>,
+
+    // Affinity calculation
+    #[serde(default)]
+    pub player_chara_id: Option<i32>, // Character ID for affinity score calculation (p0)
+    #[serde(default)]
+    pub player_chara_id_2: Option<i32>, // Second character ID for dual-parent training (p2)
+
+    // Desired main character filter
+    #[serde(default)]
+    pub desired_main_chara_id: Option<i32>, // Filter inheritances where main parent is this character (p0 parent)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

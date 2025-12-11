@@ -1,26 +1,22 @@
-use axum::{
-    http::StatusCode,
-    response::Json,
-    routing::get,
-    Router,
-};
+use axum::{http::StatusCode, response::Json, routing::get, Router};
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use tower::ServiceBuilder;
 use tower_http::{
-    cors::{CorsLayer, Any},
+    cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
-use tracing::{info, warn, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
-mod models;
-mod handlers;
+mod cache;
 mod database;
 mod errors;
+mod handlers;
 mod middleware;
+mod models;
 
-use handlers::{circles, search, stats, tasks, sharing};
+use handlers::{circles, search, sharing, stats, tasks};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,21 +25,28 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with reduced SQL verbosity
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_env_filter(
-            EnvFilter::new("honsemoe_backend=info,sqlx=warn,info")
-        )
-        .init();
+    // Initialize tracing - production uses WARN/ERROR only, development uses INFO
+    let is_development = std::env::var("DEBUG_MODE").unwrap_or_default() == "true";
+
+    if is_development {
+        tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_env_filter(EnvFilter::new("honsemoe_backend=info,sqlx=info,info"))
+            .init();
+        info!("🔧 Development mode: INFO logging enabled with SQL query logging");
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(Level::WARN)
+            .with_env_filter(EnvFilter::new("honsemoe_backend=warn,sqlx=warn,warn"))
+            .init();
+    }
 
     // Load environment variables
     dotenvy::dotenv().ok();
 
     // Database connection
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set");
-    
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
     let pool = database::create_pool(&database_url)
         .await
         .expect("Failed to connect to PostgreSQL");
@@ -52,29 +55,38 @@ async fn main() -> anyhow::Result<()> {
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
         .map(|v| v.to_lowercase() == "true" || v == "1")
         .unwrap_or(false);
-    
+
     if skip_migrations {
         warn!("⚠️ Skipping migrations due to SKIP_MIGRATIONS=true");
     } else {
+        info!("🔄 Running database migrations...");
         match sqlx::migrate!("./migrations").run(&pool).await {
             Ok(_) => info!("✅ Migrations completed successfully"),
             Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
-                warn!("⚠️  Migration version mismatch: {}", version);
-                warn!("Database has different migration state than expected");
-                warn!("Consider resetting migrations: DROP TABLE _sqlx_migrations;");
+                error!("⚠️  Migration version mismatch: {}", version);
+                error!("Database has different migration state than expected");
+                error!("Consider resetting migrations: DROP TABLE _sqlx_migrations;");
+                return Err(anyhow::anyhow!("Migration version mismatch"));
             }
             Err(e) => {
-                warn!("❌ Failed to run migrations: {}", e);
-                warn!("Continuing without migrations (set SKIP_MIGRATIONS=true to suppress this warning)");
+                error!("❌ Failed to run migrations: {}", e);
+                error!("Migration error details: {:?}", e);
+                return Err(anyhow::anyhow!("Migration failed: {}", e));
             }
         }
     }
 
-    let state = AppState { db: pool };
+    let state = AppState { db: pool.clone() };
+
+    // Start background task to refresh materialized views every hour
+    tokio::spawn(refresh_stats_task(pool.clone()));
+
+    // Start background task to clean up expired cache entries every 10 minutes
+    tokio::spawn(cache_cleanup_task());
 
     // Configure CORS - more permissive for development, strict for production
     let is_development = std::env::var("DEBUG_MODE").unwrap_or_default() == "true";
-    
+
     let cors = if is_development {
         info!("🔓 Development mode: Using permissive CORS");
         CorsLayer::new()
@@ -83,9 +95,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let allowed_origins = std::env::var("ALLOWED_ORIGINS")
             .unwrap_or_else(|_| "https://honse.moe,https://www.honse.moe,https://uma.moe,https://www.uma.moe,http://honse.moe,http://www.honse.moe,http://uma.moe,http://www.uma.moe".to_string());
-        
+
         info!("🔍 Raw ALLOWED_ORIGINS: {}", allowed_origins);
-        
+
         let origins: Result<Vec<_>, _> = allowed_origins
             .split(',')
             .map(|origin| {
@@ -94,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
                 trimmed.parse()
             })
             .collect();
-        
+
         match origins {
             Ok(parsed_origins) => {
                 info!("🔒 Production mode: CORS configured for origins: {}", allowed_origins);
@@ -147,11 +159,11 @@ async fn main() -> anyhow::Result<()> {
     // Build the application with proper routing and middleware
     // Public endpoints (no Turnstile, permissive CORS)
     let public_routes = Router::new()
-        .nest("/api/circles", circles::router())
+        .nest("/api/v4/circles", circles::router())
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(CorsLayer::permissive()) // Allow all origins for public API
+                .layer(CorsLayer::permissive()), // Allow all origins for public API
         )
         .with_state(state.clone());
 
@@ -166,8 +178,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(axum::middleware::from_fn(middleware::turnstile_verification_middleware))
-                .layer(cors)
+                //.layer(axum::middleware::from_fn(middleware::turnstile_verification_middleware))
+                .layer(cors),
         )
         .with_state(state);
 
@@ -182,13 +194,16 @@ async fn main() -> anyhow::Result<()> {
         .expect("PORT must be a valid number");
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    
+
     info!("🚀 Server starting on http://{}:{}", host, port);
 
-    // Start the server - compatible with both Axum 0.6 and 0.7
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    // Start the server using Axum 0.7 syntax
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -201,10 +216,64 @@ async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
         "version": "1.0.0",
         "endpoints": {
             "search": "/api/v3/search",
-            "stats": "/api/stats", 
+            "stats": "/api/stats",
             "tasks": "/api/tasks",
-            "circles": "/api/circles",
+            "circles": "/api/v4/circles",
             "health": "/api/health"
         }
     })))
+}
+
+// Background task to refresh materialized views periodically
+async fn refresh_stats_task(pool: PgPool) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // 1 hour
+
+    info!("🔄 Starting stats refresh background task (runs every hour)");
+
+    loop {
+        interval.tick().await;
+
+        // Try concurrent refresh first, fall back to regular refresh if needed
+        match sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY stats_counts")
+            .execute(&pool)
+            .await
+        {
+            Ok(_) => info!("✅ Materialized view stats_counts refreshed successfully (concurrent)"),
+            Err(_) => {
+                // Fall back to non-concurrent refresh
+                match sqlx::query("REFRESH MATERIALIZED VIEW stats_counts")
+                    .execute(&pool)
+                    .await
+                {
+                    Ok(_) => info!(
+                        "✅ Materialized view stats_counts refreshed successfully (non-concurrent)"
+                    ),
+                    Err(e) => warn!("⚠️ Failed to refresh stats_counts: {}", e),
+                }
+            }
+        }
+    }
+}
+
+// Background task to clean up expired cache entries
+async fn cache_cleanup_task() {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600)); // 10 minutes
+
+    info!("🧹 Starting cache cleanup background task (runs every 10 minutes)");
+
+    loop {
+        interval.tick().await;
+
+        // Clean up expired entries
+        cache::cleanup_expired();
+
+        // Log cache stats
+        let stats = cache::stats();
+        info!(
+            "📊 Cache stats: {} entries, {:.2} MB total, {} expired",
+            stats.entry_count,
+            stats.total_size_bytes as f64 / 1_048_576.0,
+            stats.expired_count
+        );
+    }
 }

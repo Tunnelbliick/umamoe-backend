@@ -1,7 +1,6 @@
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc, NaiveDateTime};
 use sqlx::FromRow;
-use validator::Validate;
 use uuid::Uuid;
 
 // Legacy support card models
@@ -17,7 +16,6 @@ pub struct SupportCardRecord {
     pub upvotes: i32,
     pub downvotes: i32,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SupportCardSearchFilters {

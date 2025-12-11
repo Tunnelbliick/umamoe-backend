@@ -1,5 +1,5 @@
 [package]
-name = "honsemoe-backend"
+name = "honsemoe-backend-v2"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,7 +11,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokio = { version = "1.0", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "migrate", "json", "decimal-postgres"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "migrate", "json"] }
 rust_decimal = "1.34"
 
 # Serialization
@@ -41,3 +41,5 @@ dotenvy = "0.15"
 
 # HTTP client (for external API calls if needed)
 reqwest = { version = "0.12", features = ["json"] }
+serde_qs = "0.15.0"
+url = "2.5.7"

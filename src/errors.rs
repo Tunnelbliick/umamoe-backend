@@ -9,13 +9,13 @@ use serde_json::json;
 pub enum AppError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    
+
     #[error("Database error: {0}")]
     DatabaseError(String),
-    
+
     #[error("Bad request: {0}")]
     BadRequest(String),
-    
+
     #[error("Not found: {0}")]
     NotFound(String),
 }

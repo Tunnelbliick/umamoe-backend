@@ -1,6 +1,6 @@
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use chrono::NaiveDateTime;
 
 /// Circle model representing a game circle/guild
 #[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
@@ -19,6 +19,10 @@ pub struct Circle {
     pub monthly_point: Option<i64>,
     pub last_month_rank: Option<i32>,
     pub last_month_point: Option<i64>,
+    pub archived: Option<bool>,
+    pub yesterday_updated: Option<NaiveDateTime>,
+    pub yesterday_points: Option<i64>,
+    pub yesterday_rank: Option<i32>,
 }
 
 /// Circle member fans monthly tracking

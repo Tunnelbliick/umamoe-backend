@@ -1,21 +1,24 @@
 use axum::{
-    extract::{State, Path},
+    extract::{Path, State},
     response::Json,
-    routing::{post, get},
+    routing::{get, post},
     Router,
 };
 use serde_json::json;
 use validator::Validate;
 
-use crate::models::{CreateTaskRequest, TrainerSubmissionRequest, TaskResponse};
-use crate::AppState;
 use crate::errors::AppError;
+use crate::models::{CreateTaskRequest, TaskResponse, TrainerSubmissionRequest};
+use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/submit", post(submit_trainer_id))
         .route("/task", post(create_task))
-        .route("/report-unavailable/:trainer_id", post(report_trainer_unavailable))
+        .route(
+            "/report-unavailable/:trainer_id",
+            post(report_trainer_unavailable),
+        )
         .route("/track-copy/:trainer_id", post(track_trainer_copy))
         .route("/trainer/:trainer_id/status", get(get_trainer_status))
 }
@@ -27,8 +30,14 @@ async fn submit_trainer_id(
 ) -> Result<Json<TaskResponse>, AppError> {
     // Validate trainer ID format (9-12 digits)
     let trainer_id = payload.trainer_id.trim();
-    if trainer_id.is_empty() || !trainer_id.chars().all(|c| c.is_ascii_digit()) || trainer_id.len() < 9 || trainer_id.len() > 12 {
-        return Err(AppError::BadRequest("Invalid trainer ID format. Must be 9-12 digits.".to_string()));
+    if trainer_id.is_empty()
+        || !trainer_id.chars().all(|c| c.is_ascii_digit())
+        || trainer_id.len() < 9
+        || trainer_id.len() > 12
+    {
+        return Err(AppError::BadRequest(
+            "Invalid trainer ID format. Must be 9-12 digits.".to_string(),
+        ));
     }
 
     // Create task data
@@ -74,12 +83,12 @@ async fn create_task(
     Json(payload): Json<CreateTaskRequest>,
 ) -> Result<Json<TaskResponse>, AppError> {
     // Validate the request
-    payload.validate().map_err(|e| {
-        AppError::BadRequest(format!("Validation error: {}", e))
-    })?;
+    payload
+        .validate()
+        .map_err(|e| AppError::BadRequest(format!("Validation error: {}", e)))?;
 
     let priority = payload.priority.unwrap_or(0);
-    
+
     // Insert task into database
     let task = sqlx::query_as::<_, crate::models::Task>(
         r#"
@@ -118,8 +127,14 @@ async fn report_trainer_unavailable(
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Validate trainer ID
     let trainer_id = trainer_id.trim();
-    if trainer_id.is_empty() || !trainer_id.chars().all(|c| c.is_ascii_digit()) || trainer_id.len() < 9 || trainer_id.len() > 12 {
-        return Err(AppError::BadRequest("Invalid trainer ID format".to_string()));
+    if trainer_id.is_empty()
+        || !trainer_id.chars().all(|c| c.is_ascii_digit())
+        || trainer_id.len() < 9
+        || trainer_id.len() > 12
+    {
+        return Err(AppError::BadRequest(
+            "Invalid trainer ID format".to_string(),
+        ));
     }
 
     // Create task data for friend search (force update)
@@ -132,7 +147,7 @@ async fn report_trainer_unavailable(
         r#"
         INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
         VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
-        "#
+        "#,
     )
     .bind("friend/search")
     .bind(&task_data)
@@ -159,8 +174,14 @@ async fn track_trainer_copy(
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Validate trainer ID
     let trainer_id = trainer_id.trim();
-    if trainer_id.is_empty() || !trainer_id.chars().all(|c| c.is_ascii_digit()) || trainer_id.len() < 9 || trainer_id.len() > 12 {
-        return Err(AppError::BadRequest("Invalid trainer ID format".to_string()));
+    if trainer_id.is_empty()
+        || !trainer_id.chars().all(|c| c.is_ascii_digit())
+        || trainer_id.len() < 9
+        || trainer_id.len() > 12
+    {
+        return Err(AppError::BadRequest(
+            "Invalid trainer ID format".to_string(),
+        ));
     }
 
     // Increment copy count
@@ -173,7 +194,7 @@ async fn track_trainer_copy(
             copy_count = trainer_copies.copy_count + 1,
             last_copied = CURRENT_TIMESTAMP
         RETURNING copy_count
-        "#
+        "#,
     )
     .bind(trainer_id)
     .fetch_one(&state.db)
@@ -184,10 +205,11 @@ async fn track_trainer_copy(
     })?;
 
     // If copy count reaches threshold (e.g., 10), create a re-check task
-    if copy_count >= 10 && copy_count % 10 == 0 { // Every 10 copies
+    if copy_count >= 10 && copy_count % 10 == 0 {
+        // Every 10 copies
         // Check if trainer was previously marked as unavailable
         let was_unavailable = sqlx::query_scalar::<_, bool>(
-            "SELECT follower_num > 1000 FROM trainer WHERE account_id = $1"
+            "SELECT follower_num > 1000 FROM trainer WHERE account_id = $1",
         )
         .bind(trainer_id)
         .fetch_optional(&state.db)
@@ -207,7 +229,7 @@ async fn track_trainer_copy(
                 r#"
                 INSERT INTO tasks (task_type, task_data, priority, status, created_at)
                 VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP)
-                "#
+                "#,
             )
             .bind("friend/recheck")
             .bind(&task_data)
@@ -238,7 +260,7 @@ async fn get_trainer_status(
         FROM trainer t
         LEFT JOIN trainer_copies tc ON t.account_id = tc.trainer_id
         WHERE t.account_id = $1
-        "#
+        "#,
     )
     .bind(&trainer_id)
     .fetch_optional(&state.db)

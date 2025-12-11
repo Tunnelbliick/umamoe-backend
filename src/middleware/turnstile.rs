@@ -11,7 +11,7 @@ use std::{
     sync::OnceLock,
     time::{Duration, Instant},
 };
-use tracing::{warn, error};
+use tracing::{error, warn};
 
 // Global token cache to allow reuse of validated tokens
 // Using OnceLock for thread-safe lazy initialization
@@ -47,7 +47,7 @@ pub async fn turnstile_verification_middleware(
     headers: HeaderMap,
     method: Method,
     request: axum::http::Request<axum::body::Body>,
-    next: Next<axum::body::Body>,
+    next: Next,
 ) -> Result<Response, StatusCode> {
     // Only verify POST requests
     if method != Method::POST {
@@ -57,7 +57,7 @@ pub async fn turnstile_verification_middleware(
     // Exclude certain endpoints from Turnstile verification
     let uri = request.uri();
     let path = uri.path();
-    
+
     // Skip Turnstile verification for stats and health endpoints
     if path.starts_with("/api/stats") || path == "/api/health" {
         return Ok(next.run(request).await);
@@ -70,11 +70,10 @@ pub async fn turnstile_verification_middleware(
     }
 
     // Get secret key from environment
-    let secret_key = std::env::var("TURNSTILE_SECRET_KEY")
-        .unwrap_or_else(|_| {
-            error!("TURNSTILE_SECRET_KEY environment variable not set");
-            String::new()
-        });
+    let secret_key = std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_else(|_| {
+        error!("TURNSTILE_SECRET_KEY environment variable not set");
+        String::new()
+    });
 
     if secret_key.is_empty() {
         error!("Turnstile secret key is empty - consider setting TURNSTILE_BYPASS=true for development");
@@ -129,9 +128,13 @@ pub async fn turnstile_verification_middleware(
     }
 }
 
-async fn verify_turnstile_token(token: &str, client_ip: &str, secret_key: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+async fn verify_turnstile_token(
+    token: &str,
+    client_ip: &str,
+    secret_key: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
-    
+
     let verify_request = TurnstileVerifyRequest {
         secret: secret_key.to_string(),
         response: token.to_string(),
@@ -152,7 +155,10 @@ async fn verify_turnstile_token(token: &str, client_ip: &str, secret_key: &str) 
 
     if !verify_response.success {
         if let Some(error_codes) = &verify_response.error_codes {
-            warn!("Turnstile verification failed with errors: {:?}", error_codes);
+            warn!(
+                "Turnstile verification failed with errors: {:?}",
+                error_codes
+            );
         }
         return Ok(false);
     }
@@ -200,7 +206,5 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> String {
 pub fn cleanup_expired_tokens() {
     let now = Instant::now();
     let token_cache = get_token_cache();
-    token_cache.retain(|_, cached_time| {
-        now.duration_since(*cached_time) < TOKEN_CACHE_DURATION
-    });
+    token_cache.retain(|_, cached_time| now.duration_since(*cached_time) < TOKEN_CACHE_DURATION);
 }

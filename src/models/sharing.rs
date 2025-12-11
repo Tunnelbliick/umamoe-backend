@@ -48,6 +48,6 @@ pub struct SupportCardShareData {
 
 #[derive(Debug, Deserialize)]
 pub struct SharePathParams {
-    pub share_type: String,  // "inheritance" or "support-card"
+    pub share_type: String, // "inheritance" or "support-card"
     pub account_id: String,
 }
