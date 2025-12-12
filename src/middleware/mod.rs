@@ -1,3 +1,4 @@
 pub mod turnstile;
 
-pub use turnstile::*;
+// Re-export when turnstile verification is enabled
+// pub use turnstile::*;

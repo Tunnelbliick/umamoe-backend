@@ -1,23 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ShareData {
-    pub share_type: ShareType,
-    pub account_id: String,
-    pub trainer_name: String,
-    pub title: String,
-    pub description: String,
-    pub image_url: Option<String>,
-    pub color: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ShareType {
-    Inheritance,
-    SupportCard,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct InheritanceShareData {
     pub account_id: String,
     pub trainer_name: String,
@@ -48,6 +31,6 @@ pub struct SupportCardShareData {
 
 #[derive(Debug, Deserialize)]
 pub struct SharePathParams {
-    pub share_type: String, // "inheritance" or "support-card"
+    pub share_type: String,
     pub account_id: String,
 }

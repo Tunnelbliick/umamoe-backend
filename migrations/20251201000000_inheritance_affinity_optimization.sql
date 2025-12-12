@@ -83,12 +83,6 @@ DROP MATERIALIZED VIEW IF EXISTS inheritance_default_affinity;
 -- Drop old affinity-related indexes
 DROP INDEX IF EXISTS idx_inheritance_affinity_score;
 DROP INDEX IF EXISTS idx_inheritance_lr_affinity;
-DROP INDEX IF EXISTS idx_inheritance_total_affinity_1001;
-DROP INDEX IF EXISTS idx_inheritance_total_affinity_1002;
-DROP INDEX IF EXISTS idx_inheritance_total_affinity_1003;
-DROP INDEX IF EXISTS idx_inheritance_total_affinity_1004;
-DROP INDEX IF EXISTS idx_inheritance_total_affinity_1006;
-DROP INDEX IF EXISTS idx_inheritance_total_affinity_1015;
 DROP INDEX IF EXISTS idx_inheritance_affinity_scores_gin;
 
 -- Drop redundant composite indexes
@@ -117,40 +111,16 @@ CREATE INDEX IF NOT EXISTS idx_inheritance_left_chara ON inheritance(left_chara_
 CREATE INDEX IF NOT EXISTS idx_inheritance_right_chara ON inheritance(right_chara_id);
 
 -- Default affinity sorting index (no player selected)
-CREATE INDEX idx_inheritance_default_affinity 
+CREATE INDEX IF NOT EXISTS idx_inheritance_default_affinity 
     ON inheritance ((base_affinity + race_affinity) DESC);
 
 -- Account + default affinity composite index
-CREATE INDEX idx_inheritance_account_default_affinity 
+CREATE INDEX IF NOT EXISTS idx_inheritance_account_default_affinity 
     ON inheritance (account_id, (base_affinity + race_affinity) DESC);
 
 -- Expression indexes for popular characters (player-specific affinity sorting)
 -- These are critical for fast queries when a player character is selected
 -- Formula: affinity_scores[N] + race_affinity
-
--- Character 1001 (Special Week) - most popular
-CREATE INDEX idx_inheritance_total_affinity_1001 
-    ON inheritance ((COALESCE(affinity_scores[1], 0) + COALESCE(race_affinity, 0)) DESC);
-
--- Character 1002 (Silence Suzuka)
-CREATE INDEX idx_inheritance_total_affinity_1002 
-    ON inheritance ((COALESCE(affinity_scores[2], 0) + COALESCE(race_affinity, 0)) DESC);
-
--- Character 1003 (Tokai Teio)
-CREATE INDEX idx_inheritance_total_affinity_1003 
-    ON inheritance ((COALESCE(affinity_scores[3], 0) + COALESCE(race_affinity, 0)) DESC);
-
--- Character 1004 (Marvelous Sunday)
-CREATE INDEX idx_inheritance_total_affinity_1004 
-    ON inheritance ((COALESCE(affinity_scores[4], 0) + COALESCE(race_affinity, 0)) DESC);
-
--- Character 1006 (Oguri Cap)
-CREATE INDEX idx_inheritance_total_affinity_1006 
-    ON inheritance ((COALESCE(affinity_scores[6], 0) + COALESCE(race_affinity, 0)) DESC);
-
--- Character 1015 (Gold Ship)
-CREATE INDEX idx_inheritance_total_affinity_1015 
-    ON inheritance ((COALESCE(affinity_scores[15], 0) + COALESCE(race_affinity, 0)) DESC);
 
 -- ============================================================================
 -- STEP 6: Add column comments

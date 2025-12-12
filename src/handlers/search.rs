@@ -185,6 +185,28 @@ fn add_multi_group_spark_conditions<'a>(
 
     let n = groups.len();
     
+    // Check if all groups are identical (e.g., 3x "Any 3*")
+    let all_groups_identical = group_values.windows(2).all(|w| {
+        let set1: std::collections::HashSet<i32> = w[0].iter().copied().collect();
+        let set2: std::collections::HashSet<i32> = w[1].iter().copied().collect();
+        set1 == set2
+    });
+
+    if all_groups_identical && !group_values.is_empty() {
+        // All groups are the same - we need to count how many elements match
+        // Use array intersection and check cardinality
+        query_builder.push(" AND cardinality(ARRAY(SELECT unnest(");
+        query_builder.push(column);
+        query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
+        for (i, val) in group_values[0].iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[]))) >= ");
+        query_builder.push_bind(n as i32);
+        return;
+    }
+    
     if n == 2 {
         let set1: std::collections::HashSet<i32> = group_values[0].iter().copied().collect();
         let set2: std::collections::HashSet<i32> = group_values[1].iter().copied().collect();
@@ -207,44 +229,70 @@ fn add_multi_group_spark_conditions<'a>(
             }
             query_builder.push("]::int[])");
         } else {
-            query_builder.push(" AND cardinality(");
+            // Overlapping groups - need to count matches in each group
+            query_builder.push(" AND cardinality(ARRAY(SELECT unnest(");
             query_builder.push(column);
-            query_builder.push(") >= 2 AND (");
-            query_builder.push(column);
-            query_builder.push(" && ARRAY[");
+            query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
             for (i, val) in group_values[0].iter().enumerate() {
                 if i > 0 { query_builder.push(","); }
                 query_builder.push_bind(*val);
             }
-            query_builder.push("]::int[]) AND (");
+            query_builder.push("]::int[]))) >= 1 AND cardinality(ARRAY(SELECT unnest(");
             query_builder.push(column);
-            query_builder.push(" && ARRAY[");
+            query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
             for (i, val) in group_values[1].iter().enumerate() {
                 if i > 0 { query_builder.push(","); }
                 query_builder.push_bind(*val);
             }
-            query_builder.push("]::int[])");
+            query_builder.push("]::int[]))) >= 1 AND cardinality(");
+            query_builder.push(column);
+            query_builder.push(") >= 2");
         }
     } else {
-        query_builder.push(" AND (cardinality(");
-        query_builder.push(column);
-        query_builder.push(") >= ");
-        query_builder.push_bind(n as i32);
-        
-        for values in &group_values {
-            query_builder.push(" AND ");
-            query_builder.push(column);
-            query_builder.push(" && ARRAY[");
-            for (i, val) in values.iter().enumerate() {
-                if i > 0 {
-                    query_builder.push(",");
+        // For 3+ groups, check if they're all disjoint
+        let mut all_disjoint = true;
+        for i in 0..group_values.len() {
+            for j in (i+1)..group_values.len() {
+                let set1: std::collections::HashSet<i32> = group_values[i].iter().copied().collect();
+                let set2: std::collections::HashSet<i32> = group_values[j].iter().copied().collect();
+                if !set1.is_disjoint(&set2) {
+                    all_disjoint = false;
+                    break;
                 }
+            }
+            if !all_disjoint { break; }
+        }
+
+        if all_disjoint {
+            // All groups are disjoint - simple overlap check for each
+            query_builder.push(" AND (");
+            for (idx, values) in group_values.iter().enumerate() {
+                if idx > 0 { query_builder.push(" AND "); }
+                query_builder.push(column);
+                query_builder.push(" && ARRAY[");
+                for (i, val) in values.iter().enumerate() {
+                    if i > 0 { query_builder.push(","); }
+                    query_builder.push_bind(*val);
+                }
+                query_builder.push("]::int[]");
+            }
+            query_builder.push(")");
+        } else {
+            // Some groups overlap - combine all values and count matches
+            let mut all_values: Vec<i32> = group_values.iter().flatten().copied().collect();
+            all_values.sort();
+            all_values.dedup();
+            
+            query_builder.push(" AND cardinality(ARRAY(SELECT unnest(");
+            query_builder.push(column);
+            query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
+            for (i, val) in all_values.iter().enumerate() {
+                if i > 0 { query_builder.push(","); }
                 query_builder.push_bind(*val);
             }
-            query_builder.push("]::int[]");
+            query_builder.push("]::int[]))) >= ");
+            query_builder.push_bind(n as i32);
         }
-        
-        query_builder.push(")");
     }
 }
 
@@ -333,6 +381,15 @@ fn parse_search_params(query: &str) -> UnifiedSearchParams {
         min_main_green_factors: get_i32("min_main_green_factors"),
         main_white_factors: get_vec("main_white_factors"),
         min_main_white_count: get_i32("min_main_white_count"),
+        optional_white_sparks: get_vec("optional_white_sparks"),
+        optional_main_white_factors: {
+            let v = get_vec("optional_main_white_factors");
+            if v.is_empty() {
+                get_vec("optional_main_white_sparks")
+            } else {
+                v
+            }
+        },
         support_card_id: get_i32("support_card_id"),
         min_limit_break: get_i32("min_limit_break"),
         max_limit_break: get_i32("max_limit_break"),
@@ -392,6 +449,8 @@ pub async fn unified_search(
         && params.min_main_pink_factors.is_none()
         && params.min_main_green_factors.is_none()
         && params.main_white_factors.is_empty()
+        && params.optional_white_sparks.is_empty()
+        && params.optional_main_white_factors.is_empty()
         && (params.min_main_white_count.is_none() || params.min_main_white_count == Some(0))
         && params.desired_main_chara_id.is_none()
         && params.player_chara_id.is_none()
@@ -539,8 +598,53 @@ async fn execute_search_query(
             ("#,
     );
     query_builder.push(&affinity_expr);
+    query_builder.push(r#") as affinity_score"#);
+
+    // Parse optional white spark factor IDs for scoring
+    // Handle both comma-separated single string and multiple params
+    let optional_white_sparks_ids: Vec<i32> = params.optional_white_sparks
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|v| v.trim().parse::<i32>().ok())
+        .collect();
+    let optional_main_white_factors_ids: Vec<i32> = params.optional_main_white_factors
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|v| v.trim().parse::<i32>().ok())
+        .collect();
+
+    // Log what we're scoring
+    if !optional_white_sparks_ids.is_empty() || !optional_main_white_factors_ids.is_empty() {
+        tracing::info!("🎯 OPTIONAL SCORING: white_sparks_ids={:?}, main_white_factors_ids={:?}", 
+            optional_white_sparks_ids, optional_main_white_factors_ids);
+    }
+
+    // Add white_sparks scoring column - ONLY score factors requested for white_sparks
+    if !optional_white_sparks_ids.is_empty() {
+        query_builder.push(", calculate_sparks_score(i.white_sparks, ARRAY[");
+        for (i, val) in optional_white_sparks_ids.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[]) AS white_sparks_score");
+    } else {
+        query_builder.push(", 0 AS white_sparks_score");
+    }
+
+    // Add main_white_factors scoring column - ONLY score factors requested for main_white_factors
+    if !optional_main_white_factors_ids.is_empty() {
+        query_builder.push(", calculate_sparks_score(i.main_white_factors, ARRAY[");
+        for (i, val) in optional_main_white_factors_ids.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[]) AS main_white_factors_score");
+    } else {
+        query_builder.push(", 0 AS main_white_factors_score");
+    }
+
     query_builder.push(
-        r#") as affinity_score,
+        r#",
             -- Support card fields (best one per account)
             sc.support_card_id,
             sc.limit_break_count,
@@ -713,6 +817,49 @@ async fn execute_search_query(
         query_builder.push_bind(min_main_white_count);
     }
 
+    // GIN-optimized filter: include rows that have at least one matching optional spark
+    // Filter each column separately based on what the user actually requested
+    let white_sparks_expanded: Vec<i32> = optional_white_sparks_ids.iter()
+        .flat_map(|&factor_id| (1..=9).map(move |level| factor_id * 10 + level))
+        .collect();
+    let main_white_factors_expanded: Vec<i32> = optional_main_white_factors_ids.iter()
+        .flat_map(|&factor_id| (1..=9).map(move |level| factor_id * 10 + level))
+        .collect();
+
+    let has_white_sparks_filter = !white_sparks_expanded.is_empty();
+    let has_main_white_factors_filter = !main_white_factors_expanded.is_empty();
+
+    if has_white_sparks_filter && has_main_white_factors_filter {
+        // Both specified: must match at least one in EITHER column (combined filter)
+        query_builder.push(" AND (i.white_sparks && ARRAY[");
+        for (i, val) in white_sparks_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[] OR i.main_white_factors && ARRAY[");
+        for (i, val) in main_white_factors_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[])");
+    } else if has_white_sparks_filter {
+        // Only white_sparks specified: filter only on white_sparks
+        query_builder.push(" AND i.white_sparks && ARRAY[");
+        for (i, val) in white_sparks_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[]");
+    } else if has_main_white_factors_filter {
+        // Only main_white_factors specified: filter only on main_white_factors
+        query_builder.push(" AND i.main_white_factors && ARRAY[");
+        for (i, val) in main_white_factors_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[]");
+    }
+
     if let Some(max_follower_num) = params.max_follower_num {
         query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num <= ");
         query_builder.push_bind(max_follower_num);
@@ -733,47 +880,117 @@ async fn execute_search_query(
     }
 
     // Simplified ordering - use indexed columns
+    // When optional scoring is provided, make it the PRIMARY sort criteria
+    let has_optional_scoring = !optional_white_sparks_ids.is_empty() || !optional_main_white_factors_ids.is_empty();
+
     let order_by_clause = match params.sort_by.as_deref() {
-        Some("affinity") => {
+        Some("affinity") | Some("affinity_score") => {
             // Affinity-based sorting - uses expression index
             // Use desired_main_chara_id for affinity if provided
             let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
             let affinity_expr = get_affinity_expression(affinity_player_id);
-            format!(" ORDER BY {} DESC", affinity_expr)
+            if has_optional_scoring {
+                // Optional scoring takes priority, then affinity as tiebreaker
+                format!(" ORDER BY white_sparks_score DESC, main_white_factors_score DESC, {} DESC", affinity_expr)
+            } else {
+                format!(" ORDER BY {} DESC", affinity_expr)
+            }
         }
-        Some("win_count") => " ORDER BY i.win_count DESC, t.account_id ASC".to_string(),
-        Some("white_count") => " ORDER BY i.white_count DESC, t.account_id ASC".to_string(),
-        Some("parent_rank") => " ORDER BY i.parent_rank DESC, t.account_id ASC".to_string(),
+        Some("win_count") => {
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.win_count DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY i.win_count DESC, t.account_id ASC".to_string()
+            }
+        }
+        Some("white_count") => {
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.white_count DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY i.white_count DESC, t.account_id ASC".to_string()
+            }
+        }
+        Some("parent_rank") => {
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.parent_rank DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY i.parent_rank DESC, t.account_id ASC".to_string()
+            }
+        }
         Some("submitted_at") | Some("last_updated") => {
-            " ORDER BY t.last_updated DESC, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, t.last_updated DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY t.last_updated DESC, t.account_id ASC".to_string()
+            }
         }
         Some("main_blue_factors") => {
-            " ORDER BY i.main_blue_factors DESC, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_blue_factors DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY i.main_blue_factors DESC, t.account_id ASC".to_string()
+            }
         }
         Some("main_pink_factors") => {
-            " ORDER BY i.main_pink_factors DESC, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_pink_factors DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY i.main_pink_factors DESC, t.account_id ASC".to_string()
+            }
         }
         Some("main_green_factors") => {
-            " ORDER BY i.main_green_factors DESC, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_green_factors DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY i.main_green_factors DESC, t.account_id ASC".to_string()
+            }
         }
         Some("main_white_count") => {
-            " ORDER BY i.main_white_count DESC, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_white_count DESC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY i.main_white_count DESC, t.account_id ASC".to_string()
+            }
         }
         Some("experience") => {
-            " ORDER BY sc.experience DESC NULLS LAST, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, sc.experience DESC NULLS LAST, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY sc.experience DESC NULLS LAST, t.account_id ASC".to_string()
+            }
         }
         Some("limit_break_count") => {
-            " ORDER BY sc.limit_break_count DESC NULLS LAST, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, sc.limit_break_count DESC NULLS LAST, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY sc.limit_break_count DESC NULLS LAST, t.account_id ASC".to_string()
+            }
         }
         Some("follower_num") => {
-            " ORDER BY COALESCE(t.follower_num, 999999) ASC, t.account_id ASC".to_string()
+            if has_optional_scoring {
+                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, COALESCE(t.follower_num, 999999) ASC, t.account_id ASC".to_string()
+            } else {
+                " ORDER BY COALESCE(t.follower_num, 999999) ASC, t.account_id ASC".to_string()
+            }
+        }
+        Some("white_sparks_score") => {
+            // Sort primarily by combined optional sparks score
+            " ORDER BY (white_sparks_score + main_white_factors_score) DESC, t.account_id ASC".to_string()
+        }
+        Some("main_white_factors_score") => {
+            // Sort primarily by combined optional sparks score
+            " ORDER BY (white_sparks_score + main_white_factors_score) DESC, t.account_id ASC".to_string()
         }
         _ => {
             // Default: use affinity ordering for best results
             // Use desired_main_chara_id for affinity if provided
             let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
             let affinity_expr = get_affinity_expression(affinity_player_id);
-            format!(" ORDER BY {} DESC", affinity_expr)
+            if has_optional_scoring {
+                format!(" ORDER BY (white_sparks_score + main_white_factors_score) DESC, {} DESC", affinity_expr)
+            } else {
+                format!(" ORDER BY {} DESC", affinity_expr)
+            }
         }
     };
 
@@ -905,6 +1122,8 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
         && params.min_main_pink_factors.is_none()
         && params.min_main_green_factors.is_none()
         && params.main_white_factors.is_empty()
+        && params.optional_white_sparks.is_empty()
+        && params.optional_main_white_factors.is_empty()
         && (params.min_main_white_count.is_none() || params.min_main_white_count == Some(0))
         && params.desired_main_chara_id.is_none()
         && params.player_chara_id.is_none()

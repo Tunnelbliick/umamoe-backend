@@ -12,6 +12,7 @@ pub struct SearchResponse<T> {
 }
 
 // V3 Search API models
+#[allow(dead_code)] // Some fields are parsed for API compatibility but not yet used
 #[derive(Debug, Deserialize)]
 pub struct UnifiedSearchParams {
     #[serde(default)]
@@ -71,6 +72,14 @@ pub struct UnifiedSearchParams {
     pub main_white_factors: Vec<String>,
     #[serde(default)]
     pub min_main_white_count: Option<i32>,
+
+    // Optional white skill scoring (soft preference, not hard filter)
+    // These take skill TYPE IDs only (factor_id), not encoded values
+    // Scoring: COUNT(DISTINCT types) * 100 + SUM(levels) - prioritizes more matches over higher levels
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub optional_white_sparks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_string_from_query")]
+    pub optional_main_white_factors: Vec<String>,
 
     // Support card filtering
     #[serde(default)]
