@@ -194,15 +194,15 @@ fn add_multi_group_spark_conditions<'a>(
 
     if all_groups_identical && !group_values.is_empty() {
         // All groups are the same - we need to count how many elements match
-        // Use array intersection and check cardinality
-        query_builder.push(" AND cardinality(ARRAY(SELECT unnest(");
+        // Use the fast count_array_overlap function instead of slow INTERSECT subquery
+        query_builder.push(" AND count_array_overlap(");
         query_builder.push(column);
-        query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
+        query_builder.push(", ARRAY[");
         for (i, val) in group_values[0].iter().enumerate() {
             if i > 0 { query_builder.push(","); }
             query_builder.push_bind(*val);
         }
-        query_builder.push("]::int[]))) >= ");
+        query_builder.push("]::int[]) >= ");
         query_builder.push_bind(n as i32);
         return;
     }
@@ -229,22 +229,22 @@ fn add_multi_group_spark_conditions<'a>(
             }
             query_builder.push("]::int[])");
         } else {
-            // Overlapping groups - need to count matches in each group
-            query_builder.push(" AND cardinality(ARRAY(SELECT unnest(");
+            // Overlapping groups - use fast count_array_overlap function for each group
+            query_builder.push(" AND count_array_overlap(");
             query_builder.push(column);
-            query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
+            query_builder.push(", ARRAY[");
             for (i, val) in group_values[0].iter().enumerate() {
                 if i > 0 { query_builder.push(","); }
                 query_builder.push_bind(*val);
             }
-            query_builder.push("]::int[]))) >= 1 AND cardinality(ARRAY(SELECT unnest(");
+            query_builder.push("]::int[]) >= 1 AND count_array_overlap(");
             query_builder.push(column);
-            query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
+            query_builder.push(", ARRAY[");
             for (i, val) in group_values[1].iter().enumerate() {
                 if i > 0 { query_builder.push(","); }
                 query_builder.push_bind(*val);
             }
-            query_builder.push("]::int[]))) >= 1 AND cardinality(");
+            query_builder.push("]::int[]) >= 1 AND cardinality(");
             query_builder.push(column);
             query_builder.push(") >= 2");
         }
@@ -278,19 +278,19 @@ fn add_multi_group_spark_conditions<'a>(
             }
             query_builder.push(")");
         } else {
-            // Some groups overlap - combine all values and count matches
+            // Some groups overlap - use fast count_array_overlap function
             let mut all_values: Vec<i32> = group_values.iter().flatten().copied().collect();
             all_values.sort();
             all_values.dedup();
             
-            query_builder.push(" AND cardinality(ARRAY(SELECT unnest(");
+            query_builder.push(" AND count_array_overlap(");
             query_builder.push(column);
-            query_builder.push(") INTERSECT SELECT unnest(ARRAY[");
+            query_builder.push(", ARRAY[");
             for (i, val) in all_values.iter().enumerate() {
                 if i > 0 { query_builder.push(","); }
                 query_builder.push_bind(*val);
             }
-            query_builder.push("]::int[]))) >= ");
+            query_builder.push("]::int[]) >= ");
             query_builder.push_bind(n as i32);
         }
     }
@@ -376,6 +376,14 @@ fn parse_search_params(query: &str) -> UnifiedSearchParams {
         main_parent_white_sparks: get_vec("main_parent_white_sparks"),
         min_win_count: get_i32("min_win_count"),
         min_white_count: get_i32("min_white_count"),
+        min_blue_stars_sum: get_i32("min_blue_stars_sum"),
+        max_blue_stars_sum: get_i32("max_blue_stars_sum"),
+        min_pink_stars_sum: get_i32("min_pink_stars_sum"),
+        max_pink_stars_sum: get_i32("max_pink_stars_sum"),
+        min_green_stars_sum: get_i32("min_green_stars_sum"),
+        max_green_stars_sum: get_i32("max_green_stars_sum"),
+        min_white_stars_sum: get_i32("min_white_stars_sum"),
+        max_white_stars_sum: get_i32("max_white_stars_sum"),
         min_main_blue_factors: get_i32("min_main_blue_factors"),
         min_main_pink_factors: get_i32("min_main_pink_factors"),
         min_main_green_factors: get_i32("min_main_green_factors"),
@@ -445,6 +453,14 @@ pub async fn unified_search(
         && params.min_experience.is_none()
         && (params.min_win_count.is_none() || params.min_win_count == Some(0))
         && (params.min_white_count.is_none() || params.min_white_count == Some(0))
+        && params.min_blue_stars_sum.is_none()
+        && params.max_blue_stars_sum.is_none()
+        && params.min_pink_stars_sum.is_none()
+        && params.max_pink_stars_sum.is_none()
+        && params.min_green_stars_sum.is_none()
+        && params.max_green_stars_sum.is_none()
+        && params.min_white_stars_sum.is_none()
+        && params.max_white_stars_sum.is_none()
         && params.min_main_blue_factors.is_none()
         && params.min_main_pink_factors.is_none()
         && params.min_main_green_factors.is_none()
@@ -456,32 +472,57 @@ pub async fn unified_search(
         && params.player_chara_id.is_none()
         && (params.max_follower_num.is_none() || params.max_follower_num == Some(1000) || params.max_follower_num == Some(999));
 
-    // Cache only blank queries (materialized view makes these instant anyway)
-    if is_blank_query {
-        let search_type = params.search_type.as_deref().unwrap_or("all");
-        let sort_by = params.sort_by.as_deref().unwrap_or("default");
-        let cache_key = format!(
-            "search:blank:{}:{}:page{}:limit{}",
-            search_type, sort_by, page, limit
-        );
-        if let Some(cached) = crate::cache::get::<SearchResponse<UnifiedAccountRecord>>(&cache_key)
-        {
-            tracing::info!(
-                "🎯 CACHE HIT: search - type={}, sort={}, page={}, limit={}",
-                search_type,
-                sort_by,
-                page,
-                limit
-            );
-            return Ok(Json(cached));
-        }
-        tracing::info!(
-            "❌ CACHE MISS: search - type={}, sort={}, page={}, limit={}",
-            search_type,
-            sort_by,
-            page,
-            limit
-        );
+    // Build a comprehensive search cache key for all queries (not just blank)
+    // This caches search results for common filter combinations
+    // IMPORTANT: Must include ALL filter parameters to avoid returning wrong cached results
+    let search_cache_key = format!(
+        "search:p{}:l{}:sort={}:order={}:player={}:follower={}:type={}:main={}:left={}:right={}:rank={}:rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mpb={}:mpp={}:mpg={}:mpw={}:win={}:wh={}:mmb={}:mmp={}:mmg={}:mwf={}:mwh={}:owh={}:omwf={}:bsum={}:psum={}:gsum={}:wsum={}:sc={}:lb={}:exp={}:trainer={}:desired={}",
+        page, limit,
+        params.sort_by.as_deref().unwrap_or("default"),
+        params.sort_order.as_deref().unwrap_or("desc"),
+        params.player_chara_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.max_follower_num.map(|v| v.to_string()).unwrap_or_else(|| "def".to_string()),
+        params.search_type.as_deref().unwrap_or("all"),
+        params.main_parent_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.parent_left_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.parent_right_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.parent_rank.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.parent_rarity.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        if params.blue_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.blue_sparks) },
+        if params.pink_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.pink_sparks) },
+        if params.green_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.green_sparks) },
+        if params.white_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.white_sparks) },
+        params.blue_sparks_9star.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.pink_sparks_9star.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.green_sparks_9star.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        if params.main_parent_blue_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.main_parent_blue_sparks) },
+        if params.main_parent_pink_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.main_parent_pink_sparks) },
+        if params.main_parent_green_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.main_parent_green_sparks) },
+        if params.main_parent_white_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.main_parent_white_sparks) },
+        params.min_win_count.unwrap_or(0),
+        params.min_white_count.unwrap_or(0),
+        params.min_main_blue_factors.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_main_pink_factors.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_main_green_factors.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        if params.main_white_factors.is_empty() { "any".to_string() } else { format!("{:?}", params.main_white_factors) },
+        params.min_main_white_count.unwrap_or(0),
+        if params.optional_white_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.optional_white_sparks) },
+        if params.optional_main_white_factors.is_empty() { "any".to_string() } else { format!("{:?}", params.optional_main_white_factors) },
+        format!("{:?}-{:?}", params.min_blue_stars_sum, params.max_blue_stars_sum),
+        format!("{:?}-{:?}", params.min_pink_stars_sum, params.max_pink_stars_sum),
+        format!("{:?}-{:?}", params.min_green_stars_sum, params.max_green_stars_sum),
+        format!("{:?}-{:?}", params.min_white_stars_sum, params.max_white_stars_sum),
+        params.support_card_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        format!("{:?}-{:?}", params.min_limit_break, params.max_limit_break),
+        params.min_experience.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.trainer_id.as_deref().unwrap_or("any"),
+        params.desired_main_chara_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string())
+    );
+
+    // Try cache for all queries (not just blank ones)
+    if let Some(cached) = crate::cache::get::<SearchResponse<UnifiedAccountRecord>>(&search_cache_key) {
+        tracing::info!("🎯 CACHE HIT: search results");
+        return Ok(Json(cached));
     }
 
     let query_start = std::time::Instant::now();
@@ -519,23 +560,15 @@ pub async fn unified_search(
         total_pages,
     };
 
-    // Cache blank queries for 1 hour (materialized view makes these instant)
-    if is_blank_query {
-        let search_type = params.search_type.as_deref().unwrap_or("all");
-        let sort_by = params.sort_by.as_deref().unwrap_or("default");
-        let cache_key = format!(
-            "search:blank:{}:{}:page{}:limit{}",
-            search_type, sort_by, page, limit
-        );
-        if crate::cache::set(&cache_key, &response, std::time::Duration::from_secs(3600)).is_ok() {
-            tracing::info!(
-                "💾 CACHE SET: search - type={}, sort={}, page={}, limit={}",
-                search_type,
-                sort_by,
-                page,
-                limit
-            );
-        }
+    // Cache all search results - blank queries for 1 hour, filtered for 5 minutes
+    let cache_ttl = if is_blank_query {
+        std::time::Duration::from_secs(3600) // 1 hour for blank queries
+    } else {
+        std::time::Duration::from_secs(300) // 5 minutes for filtered queries
+    };
+    
+    if crate::cache::set(&search_cache_key, &response, cache_ttl).is_ok() {
+        tracing::info!("💾 CACHE SET: search results (ttl={}s)", cache_ttl.as_secs());
     }
 
     tracing::info!(
@@ -594,6 +627,10 @@ async fn execute_search_query(
             i.main_green_factors,
             i.main_white_factors,
             i.main_white_count,
+            i.blue_stars_sum,
+            i.pink_stars_sum,
+            i.green_stars_sum,
+            i.white_stars_sum,
             -- Affinity score calculation
             ("#,
     );
@@ -619,29 +656,30 @@ async fn execute_search_query(
             optional_white_sparks_ids, optional_main_white_factors_ids);
     }
 
-    // Add white_sparks scoring column - ONLY score factors requested for white_sparks
-    if !optional_white_sparks_ids.is_empty() {
-        query_builder.push(", calculate_sparks_score(i.white_sparks, ARRAY[");
-        for (i, val) in optional_white_sparks_ids.iter().enumerate() {
-            if i > 0 { query_builder.push(","); }
-            query_builder.push_bind(*val);
-        }
-        query_builder.push("]::int[]) AS white_sparks_score");
+    // Construct scoring expressions for use in SELECT and ORDER BY
+    let white_sparks_score_expr = if !optional_white_sparks_ids.is_empty() {
+        let ids_str = optional_white_sparks_ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        format!("calculate_sparks_score(i.white_sparks, ARRAY[{}]::int[])", ids_str)
     } else {
-        query_builder.push(", 0 AS white_sparks_score");
-    }
+        "0".to_string()
+    };
 
-    // Add main_white_factors scoring column - ONLY score factors requested for main_white_factors
-    if !optional_main_white_factors_ids.is_empty() {
-        query_builder.push(", calculate_sparks_score(i.main_white_factors, ARRAY[");
-        for (i, val) in optional_main_white_factors_ids.iter().enumerate() {
-            if i > 0 { query_builder.push(","); }
-            query_builder.push_bind(*val);
-        }
-        query_builder.push("]::int[]) AS main_white_factors_score");
+    let main_white_factors_score_expr = if !optional_main_white_factors_ids.is_empty() {
+        let ids_str = optional_main_white_factors_ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        format!("calculate_sparks_score(i.main_white_factors, ARRAY[{}]::int[])", ids_str)
     } else {
-        query_builder.push(", 0 AS main_white_factors_score");
-    }
+        "0".to_string()
+    };
+
+    // Add white_sparks scoring column
+    query_builder.push(", ");
+    query_builder.push(&white_sparks_score_expr);
+    query_builder.push(" AS white_sparks_score");
+
+    // Add main_white_factors scoring column
+    query_builder.push(", ");
+    query_builder.push(&main_white_factors_score_expr);
+    query_builder.push(" AS main_white_factors_score");
 
     query_builder.push(
         r#",
@@ -677,19 +715,23 @@ async fn execute_search_query(
         query_builder.push_bind(min_experience);
     }
 
-    // Follower filter
-    query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num < 1000)");
+    // Follower filter - use provided max or default to < 1000
+    if let Some(max_follower_num) = params.max_follower_num {
+        query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num <= ");
+        query_builder.push_bind(max_follower_num);
+        query_builder.push(")");
+    } else {
+        query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num < 1000)");
+    }
 
     // Player exclusion - don't show inheritances where player is the main character
     // Use the same player ID as affinity calculation (desired_main_chara_id takes precedence)
+    // Convert to base character ID format (player_chara_id 100701 -> 1007)
     let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
     if let Some(player_id) = affinity_player_id {
-        // Only exclude if we're NOT filtering for this specific character as main parent
-        // (when desired_main_chara_id is set, we WANT that character as main parent)
-        if params.desired_main_chara_id.is_none() {
-            query_builder.push(" AND i.main_chara_id != ");
-            query_builder.push_bind(player_id);
-        }
+        let base_chara_id = if player_id > 100000 { player_id / 100 } else { player_id };
+        query_builder.push(" AND i.main_chara_id != ");
+        query_builder.push_bind(base_chara_id);
     }
 
     // Apply inheritance filters directly (no EXISTS needed)
@@ -708,11 +750,13 @@ async fn execute_search_query(
         query_builder.push_bind(main_parent_id);
     }
 
-    // Filter by desired main character (p0 parent)
+    // Filter by desired main character (p0 parent) - REMOVED because desired_main_chara_id is the CHILD
+    /*
     if let Some(desired_main_chara_id) = params.desired_main_chara_id {
         query_builder.push(" AND i.main_chara_id = ");
         query_builder.push_bind(desired_main_chara_id);
     }
+    */
 
     if let Some(parent_left_id) = params.parent_left_id {
         query_builder.push(" AND i.parent_left_id = ");
@@ -776,10 +820,12 @@ async fn execute_search_query(
         add_main_parent_spark_conditions(&mut query_builder, "i.main_green_factors", &group);
     }
 
+    // main_parent_white_sparks - REQUIRED filter for main parent's white factors
     let main_parent_white_groups = process_spark_groups(&params.main_parent_white_sparks);
-    for group in main_parent_white_groups {
-        add_spark_range_conditions(&mut query_builder, "i.main_white_factors", &group);
+    if !main_parent_white_groups.is_empty() {
+        tracing::info!("🔍 MAIN_PARENT_WHITE_SPARKS filter (SEARCH): {:?}", main_parent_white_groups);
     }
+    add_multi_group_spark_conditions(&mut query_builder, "i.main_white_factors", &main_parent_white_groups);
 
     if let Some(min_win_count) = params.min_win_count {
         query_builder.push(" AND i.win_count >= ");
@@ -789,6 +835,43 @@ async fn execute_search_query(
     if let Some(min_white_count) = params.min_white_count {
         query_builder.push(" AND i.white_count >= ");
         query_builder.push_bind(min_white_count);
+    }
+
+    // Star sum filters
+    if let Some(min) = params.min_blue_stars_sum {
+        query_builder.push(" AND i.blue_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_blue_stars_sum {
+        query_builder.push(" AND i.blue_stars_sum <= ");
+        query_builder.push_bind(max);
+    }
+
+    if let Some(min) = params.min_pink_stars_sum {
+        query_builder.push(" AND i.pink_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_pink_stars_sum {
+        query_builder.push(" AND i.pink_stars_sum <= ");
+        query_builder.push_bind(max);
+    }
+
+    if let Some(min) = params.min_green_stars_sum {
+        query_builder.push(" AND i.green_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_green_stars_sum {
+        query_builder.push(" AND i.green_stars_sum <= ");
+        query_builder.push_bind(max);
+    }
+
+    if let Some(min) = params.min_white_stars_sum {
+        query_builder.push(" AND i.white_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_white_stars_sum {
+        query_builder.push(" AND i.white_stars_sum <= ");
+        query_builder.push_bind(max);
     }
 
     // Main inherit filtering
@@ -807,10 +890,9 @@ async fn execute_search_query(
         query_builder.push_bind(min_main_green);
     }
 
+    // main_white_factors - REQUIRED filter for specific white factors on main parent (SEARCH)
     let main_white_factors_groups = process_spark_groups(&params.main_white_factors);
-    for group in main_white_factors_groups {
-        add_spark_range_conditions(&mut query_builder, "i.main_white_factors", &group);
-    }
+    add_multi_group_spark_conditions(&mut query_builder, "i.main_white_factors", &main_white_factors_groups);
 
     if let Some(min_main_white_count) = params.min_main_white_count {
         query_builder.push(" AND i.main_white_count >= ");
@@ -860,12 +942,6 @@ async fn execute_search_query(
         query_builder.push("]::int[]");
     }
 
-    if let Some(max_follower_num) = params.max_follower_num {
-        query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num <= ");
-        query_builder.push_bind(max_follower_num);
-        query_builder.push(")");
-    }
-
     // OPTIMIZATION: Add EXISTS clause for support card filtering to force index usage
     if let Some(support_card_id) = params.support_card_id {
         query_builder.push(" AND EXISTS (SELECT 1 FROM support_card sc_exists WHERE sc_exists.account_id = t.account_id AND sc_exists.support_card_id = ");
@@ -883,6 +959,24 @@ async fn execute_search_query(
     // When optional scoring is provided, make it the PRIMARY sort criteria
     let has_optional_scoring = !optional_white_sparks_ids.is_empty() || !optional_main_white_factors_ids.is_empty();
 
+    // Construct the total score expression for ORDER BY
+    // Note: We must use the full expression, not aliases, because aliases cannot be used in expressions in ORDER BY
+    let total_score_expr = format!("({} + {})", white_sparks_score_expr, main_white_factors_score_expr);
+
+    // Determine sort direction (default DESC for most fields, ASC for follower_num)
+    let sort_dir = if params.sort_order.as_deref().unwrap_or("desc").eq_ignore_ascii_case("asc") {
+        "ASC"
+    } else {
+        "DESC"
+    };
+
+    // Special sort direction for follower_num (default ASC)
+    let follower_sort_dir = if params.sort_order.as_deref().unwrap_or("asc").eq_ignore_ascii_case("desc") {
+        "DESC"
+    } else {
+        "ASC"
+    };
+
     let order_by_clause = match params.sort_by.as_deref() {
         Some("affinity") | Some("affinity_score") => {
             // Affinity-based sorting - uses expression index
@@ -891,95 +985,95 @@ async fn execute_search_query(
             let affinity_expr = get_affinity_expression(affinity_player_id);
             if has_optional_scoring {
                 // Optional scoring takes priority, then affinity as tiebreaker
-                format!(" ORDER BY white_sparks_score DESC, main_white_factors_score DESC, {} DESC", affinity_expr)
+                format!(" ORDER BY {} DESC, {} {}", total_score_expr, affinity_expr, sort_dir)
             } else {
-                format!(" ORDER BY {} DESC", affinity_expr)
+                format!(" ORDER BY {} {}", affinity_expr, sort_dir)
             }
         }
         Some("win_count") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.win_count DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, i.win_count {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY i.win_count DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY i.win_count {}, t.account_id ASC", sort_dir)
             }
         }
         Some("white_count") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.white_count DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, i.white_count {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY i.white_count DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY i.white_count {}, t.account_id ASC", sort_dir)
             }
         }
         Some("parent_rank") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.parent_rank DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, i.parent_rank {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY i.parent_rank DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY i.parent_rank {}, t.account_id ASC", sort_dir)
             }
         }
         Some("submitted_at") | Some("last_updated") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, t.last_updated DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, t.last_updated {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY t.last_updated DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY t.last_updated {}, t.account_id ASC", sort_dir)
             }
         }
         Some("main_blue_factors") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_blue_factors DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, i.main_blue_factors {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY i.main_blue_factors DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY i.main_blue_factors {}, t.account_id ASC", sort_dir)
             }
         }
         Some("main_pink_factors") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_pink_factors DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, i.main_pink_factors {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY i.main_pink_factors DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY i.main_pink_factors {}, t.account_id ASC", sort_dir)
             }
         }
         Some("main_green_factors") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_green_factors DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, i.main_green_factors {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY i.main_green_factors DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY i.main_green_factors {}, t.account_id ASC", sort_dir)
             }
         }
         Some("main_white_count") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, i.main_white_count DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, i.main_white_count {}, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY i.main_white_count DESC, t.account_id ASC".to_string()
+                format!(" ORDER BY i.main_white_count {}, t.account_id ASC", sort_dir)
             }
         }
         Some("experience") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, sc.experience DESC NULLS LAST, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, sc.experience {} NULLS LAST, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY sc.experience DESC NULLS LAST, t.account_id ASC".to_string()
+                format!(" ORDER BY sc.experience {} NULLS LAST, t.account_id ASC", sort_dir)
             }
         }
         Some("limit_break_count") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, sc.limit_break_count DESC NULLS LAST, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, sc.limit_break_count {} NULLS LAST, t.account_id ASC", total_score_expr, sort_dir)
             } else {
-                " ORDER BY sc.limit_break_count DESC NULLS LAST, t.account_id ASC".to_string()
+                format!(" ORDER BY sc.limit_break_count {} NULLS LAST, t.account_id ASC", sort_dir)
             }
         }
         Some("follower_num") => {
             if has_optional_scoring {
-                " ORDER BY (white_sparks_score + main_white_factors_score) DESC, COALESCE(t.follower_num, 999999) ASC, t.account_id ASC".to_string()
+                format!(" ORDER BY {} DESC, COALESCE(t.follower_num, 999999) {}, t.account_id ASC", total_score_expr, follower_sort_dir)
             } else {
-                " ORDER BY COALESCE(t.follower_num, 999999) ASC, t.account_id ASC".to_string()
+                format!(" ORDER BY COALESCE(t.follower_num, 999999) {}, t.account_id ASC", follower_sort_dir)
             }
         }
         Some("white_sparks_score") => {
             // Sort primarily by combined optional sparks score
-            " ORDER BY (white_sparks_score + main_white_factors_score) DESC, t.account_id ASC".to_string()
+            format!(" ORDER BY {} {}, t.account_id ASC", total_score_expr, sort_dir)
         }
         Some("main_white_factors_score") => {
             // Sort primarily by combined optional sparks score
-            " ORDER BY (white_sparks_score + main_white_factors_score) DESC, t.account_id ASC".to_string()
+            format!(" ORDER BY {} {}, t.account_id ASC", total_score_expr, sort_dir)
         }
         _ => {
             // Default: use affinity ordering for best results
@@ -987,9 +1081,9 @@ async fn execute_search_query(
             let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
             let affinity_expr = get_affinity_expression(affinity_player_id);
             if has_optional_scoring {
-                format!(" ORDER BY (white_sparks_score + main_white_factors_score) DESC, {} DESC", affinity_expr)
+                format!(" ORDER BY {} DESC, {} {}", total_score_expr, affinity_expr, sort_dir)
             } else {
-                format!(" ORDER BY {} DESC", affinity_expr)
+                format!(" ORDER BY {} {}", affinity_expr, sort_dir)
             }
         }
     };
@@ -1073,6 +1167,10 @@ async fn execute_search_query(
                     main_green_factors: row.get("main_green_factors"),
                     main_white_factors: row.get("main_white_factors"),
                     main_white_count: row.get("main_white_count"),
+                    blue_stars_sum: row.get("blue_stars_sum"),
+                    pink_stars_sum: row.get("pink_stars_sum"),
+                    green_stars_sum: row.get("green_stars_sum"),
+                    white_stars_sum: row.get("white_stars_sum"),
                     affinity_score: row.try_get("affinity_score").ok(),
                 })
             } else {
@@ -1118,6 +1216,14 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
         && params.min_experience.is_none()
         && (params.min_win_count.is_none() || params.min_win_count == Some(0))
         && (params.min_white_count.is_none() || params.min_white_count == Some(0))
+        && params.min_blue_stars_sum.is_none()
+        && params.max_blue_stars_sum.is_none()
+        && params.min_pink_stars_sum.is_none()
+        && params.max_pink_stars_sum.is_none()
+        && params.min_green_stars_sum.is_none()
+        && params.max_green_stars_sum.is_none()
+        && params.min_white_stars_sum.is_none()
+        && params.max_white_stars_sum.is_none()
         && params.min_main_blue_factors.is_none()
         && params.min_main_pink_factors.is_none()
         && params.min_main_green_factors.is_none()
@@ -1142,9 +1248,12 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
 
     // Cache counts for common filter combinations (they change infrequently)
     // Build comprehensive cache key based on ALL filters to avoid returning wrong counts
+    // NOTE: player_chara_id and max_follower_num affect the query and MUST be included
     let cache_key = format!(
-        "count:type={}:sc_id={}:lb_min={}:lb_max={}:exp_min={}:main_parent={}:p_left={}:p_right={}:p_rank={}:p_rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mp_blue={}:mp_pink={}:mp_green={}:mp_white={}:win={}:wh_cnt={}:trainer={}:trainer_name={}:desired_main={}",
+        "count:type={}:player={}:follower={}:sc_id={}:lb_min={}:lb_max={}:exp_min={}:main_parent={}:p_left={}:p_right={}:p_rank={}:p_rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mp_blue={}:mp_pink={}:mp_green={}:mp_white={}:win={}:wh_cnt={}:trainer={}:trainer_name={}:desired_main={}:b_sum_min={}:b_sum_max={}:p_sum_min={}:p_sum_max={}:g_sum_min={}:g_sum_max={}:w_sum_min={}:w_sum_max={}:mm_blue={}:mm_pink={}:mm_green={}:m_white={}:mm_wh_cnt={}:opt_wh={}:opt_m_wh={}",
         params.search_type.as_deref().unwrap_or("all"),
+        params.player_chara_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.max_follower_num.map(|v| v.to_string()).unwrap_or_else(|| "default".to_string()),
         params.support_card_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
         params.min_limit_break.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
         params.max_limit_break.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
@@ -1169,7 +1278,22 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
         params.min_white_count.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
         params.trainer_id.as_ref().unwrap_or(&"any".to_string()),
         params.trainer_name.as_ref().unwrap_or(&"any".to_string()),
-        params.desired_main_chara_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string())
+        params.desired_main_chara_id.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_blue_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.max_blue_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_pink_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.max_pink_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_green_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.max_green_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_white_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.max_white_stars_sum.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_main_blue_factors.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_main_pink_factors.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        params.min_main_green_factors.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        if params.main_white_factors.is_empty() { "any".to_string() } else { format!("{:?}", params.main_white_factors) },
+        params.min_main_white_count.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string()),
+        if params.optional_white_sparks.is_empty() { "any".to_string() } else { format!("{:?}", params.optional_white_sparks) },
+        if params.optional_main_white_factors.is_empty() { "any".to_string() } else { format!("{:?}", params.optional_main_white_factors) }
     );
 
     // Try to get cached count (cache for 5 minutes)
@@ -1187,20 +1311,27 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
             SELECT 1
             FROM inheritance i
             INNER JOIN trainer t ON i.account_id = t.account_id
-            WHERE (t.follower_num IS NULL OR t.follower_num < 1000)
+            WHERE 1=1
     "#,
     );
 
+    // Follower filter - use provided max or default to < 1000
+    if let Some(max_follower_num) = params.max_follower_num {
+        query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num <= ");
+        query_builder.push_bind(max_follower_num);
+        query_builder.push(")");
+    } else {
+        query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num < 1000)");
+    }
+
     // Player exclusion - don't show inheritances where player is the main character
     // Use the same player ID as affinity calculation (desired_main_chara_id takes precedence)
+    // Convert to base character ID format (player_chara_id 100701 -> 1007)
     let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
     if let Some(player_id) = affinity_player_id {
-        // Only exclude if we're NOT filtering for this specific character as main parent
-        // (when desired_main_chara_id is set, we WANT that character as main parent)
-        if params.desired_main_chara_id.is_none() {
-            query_builder.push(" AND i.main_chara_id != ");
-            query_builder.push_bind(player_id);
-        }
+        let base_chara_id = if player_id > 100000 { player_id / 100 } else { player_id };
+        query_builder.push(" AND i.main_chara_id != ");
+        query_builder.push_bind(base_chara_id);
     }
 
     // Apply inheritance filters directly (no EXISTS needed)
@@ -1241,6 +1372,8 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
     }
 
     // Player exclusion - use the same logic as search query
+    // (Already handled above in the main query builder)
+    /*
     let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
     if let Some(player_id) = affinity_player_id {
         // Only exclude if we're NOT filtering for this specific character as main parent
@@ -1249,12 +1382,10 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
             query_builder.push_bind(player_id);
         }
     }
+    */
 
     // Apply inheritance filters (only if inheritance table is joined)
-    if let Some(trainer_id) = &params.trainer_id {
-        query_builder.push(" AND t.account_id = ");
-        query_builder.push_bind(trainer_id);
-    }
+    // Note: trainer_id already applied above, skipping duplicate
 
     if let Some(trainer_name) = &params.trainer_name {
         query_builder.push(" AND t.name ILIKE ");
@@ -1266,11 +1397,8 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
         query_builder.push_bind(main_parent_id);
     }
 
-    // Filter by desired main character (p0 parent)
-    if let Some(desired_main_chara_id) = params.desired_main_chara_id {
-        query_builder.push(" AND i.main_chara_id = ");
-        query_builder.push_bind(desired_main_chara_id);
-    }
+    // Note: desired_main_chara_id is the CHILD character (user's uma), not the parent
+    // We exclude it from results, not filter for it
 
     if let Some(parent_left_id) = params.parent_left_id {
         query_builder.push(" AND i.parent_left_id = ");
@@ -1334,10 +1462,9 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
         add_main_parent_spark_conditions(&mut query_builder, "i.main_green_factors", &group);
     }
 
+    // main_parent_white_sparks - REQUIRED filter for main parent's white factors (COUNT)
     let main_parent_white_groups = process_spark_groups(&params.main_parent_white_sparks);
-    for group in main_parent_white_groups {
-        add_spark_range_conditions(&mut query_builder, "i.main_white_factors", &group);
-    }
+    add_multi_group_spark_conditions(&mut query_builder, "i.main_white_factors", &main_parent_white_groups);
 
     if let Some(min_win_count) = params.min_win_count {
         query_builder.push(" AND i.win_count >= ");
@@ -1347,6 +1474,43 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
     if let Some(min_white_count) = params.min_white_count {
         query_builder.push(" AND i.white_count >= ");
         query_builder.push_bind(min_white_count);
+    }
+
+    // Star sum filters
+    if let Some(min) = params.min_blue_stars_sum {
+        query_builder.push(" AND i.blue_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_blue_stars_sum {
+        query_builder.push(" AND i.blue_stars_sum <= ");
+        query_builder.push_bind(max);
+    }
+
+    if let Some(min) = params.min_pink_stars_sum {
+        query_builder.push(" AND i.pink_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_pink_stars_sum {
+        query_builder.push(" AND i.pink_stars_sum <= ");
+        query_builder.push_bind(max);
+    }
+
+    if let Some(min) = params.min_green_stars_sum {
+        query_builder.push(" AND i.green_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_green_stars_sum {
+        query_builder.push(" AND i.green_stars_sum <= ");
+        query_builder.push_bind(max);
+    }
+
+    if let Some(min) = params.min_white_stars_sum {
+        query_builder.push(" AND i.white_stars_sum >= ");
+        query_builder.push_bind(min);
+    }
+    if let Some(max) = params.max_white_stars_sum {
+        query_builder.push(" AND i.white_stars_sum <= ");
+        query_builder.push_bind(max);
     }
 
     // Main inherit filtering
@@ -1365,20 +1529,68 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
         query_builder.push_bind(min_main_green);
     }
 
+    // main_white_factors - REQUIRED filter for specific white factors on main parent (COUNT)
     let main_white_factors_groups = process_spark_groups(&params.main_white_factors);
-    for group in main_white_factors_groups {
-        add_spark_range_conditions(&mut query_builder, "i.main_white_factors", &group);
-    }
+    add_multi_group_spark_conditions(&mut query_builder, "i.main_white_factors", &main_white_factors_groups);
 
     if let Some(min_main_white_count) = params.min_main_white_count {
         query_builder.push(" AND i.main_white_count >= ");
         query_builder.push_bind(min_main_white_count);
     }
 
-    if let Some(max_follower_num) = params.max_follower_num {
-        query_builder.push(" AND (t.follower_num IS NULL OR t.follower_num <= ");
-        query_builder.push_bind(max_follower_num);
-        query_builder.push(")");
+    // Parse optional white spark factor IDs for scoring
+    let optional_white_sparks_ids: Vec<i32> = params.optional_white_sparks
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|v| v.trim().parse::<i32>().ok())
+        .collect();
+    let optional_main_white_factors_ids: Vec<i32> = params.optional_main_white_factors
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|v| v.trim().parse::<i32>().ok())
+        .collect();
+
+    // GIN-optimized filter: include rows that have at least one matching optional spark
+    // Filter each column separately based on what the user actually requested
+    let white_sparks_expanded: Vec<i32> = optional_white_sparks_ids.iter()
+        .flat_map(|&factor_id| (1..=9).map(move |level| factor_id * 10 + level))
+        .collect();
+    let main_white_factors_expanded: Vec<i32> = optional_main_white_factors_ids.iter()
+        .flat_map(|&factor_id| (1..=9).map(move |level| factor_id * 10 + level))
+        .collect();
+
+    let has_white_sparks_filter = !white_sparks_expanded.is_empty();
+    let has_main_white_factors_filter = !main_white_factors_expanded.is_empty();
+
+    if has_white_sparks_filter && has_main_white_factors_filter {
+        // Both specified: must match at least one in EITHER column (combined filter)
+        query_builder.push(" AND (i.white_sparks && ARRAY[");
+        for (i, val) in white_sparks_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[] OR i.main_white_factors && ARRAY[");
+        for (i, val) in main_white_factors_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[])");
+    } else if has_white_sparks_filter {
+        // Only white_sparks specified: filter only on white_sparks
+        query_builder.push(" AND i.white_sparks && ARRAY[");
+        for (i, val) in white_sparks_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[]");
+    } else if has_main_white_factors_filter {
+        // Only main_white_factors specified: filter only on main_white_factors
+        query_builder.push(" AND i.main_white_factors && ARRAY[");
+        for (i, val) in main_white_factors_expanded.iter().enumerate() {
+            if i > 0 { query_builder.push(","); }
+            query_builder.push_bind(*val);
+        }
+        query_builder.push("]::int[]");
     }
 
     // Optimization: If filtering by support card ID, add an EXISTS clause to help the planner

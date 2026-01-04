@@ -2,6 +2,7 @@
 import sqlite3
 import os
 import re
+import json
 from collections import defaultdict
 from datetime import datetime
 
@@ -102,12 +103,10 @@ def compute_affinity_scores(rel_points, chara_rel, max_char_id):
         max_char_id: highest character ID to include in arrays
     
     Returns:
-        tuple: (affinity_dict, race_affinity_dict) where:
-            affinity_dict: (main, left, right) -> {
+        affinity_dict: (main, left, right) -> {
                 'affinity_scores': [score for chara 1001 to max_char_id],
                 'base_affinity': int
             }
-            race_affinity_dict: (left, right) -> int (race affinity score)
     """
     chars = sorted(chara_rel.keys())
     
@@ -149,7 +148,6 @@ def compute_affinity_scores(rel_points, chara_rel, max_char_id):
     print(f"   Computing affinity arrays for all inheritance combinations...")
     
     result = {}
-    race_affinity_map = {}
     count = 0
     
     for main in chars:
@@ -161,10 +159,6 @@ def compute_affinity_scores(rel_points, chara_rel, max_char_id):
                     continue
                 
                 count += 1
-                
-                # race_affinity: aff2(left, right)
-                race_affinity = aff2.get((left, right), 0)
-                race_affinity_map[(left, right)] = race_affinity
                 
                 # base_affinity: aff2(main,left) + aff3(main,left,right)
                 base_affinity = aff2.get((main, left), 0) + aff3.get((main, left, right), 0)
@@ -187,7 +181,7 @@ def compute_affinity_scores(rel_points, chara_rel, max_char_id):
                 }
     
     print(f"   → Generated {count} inheritance combinations")
-    return result, race_affinity_map
+    return result
 
 
 def export_json(rel_points, chara_rel, max_char_id):
@@ -209,6 +203,42 @@ def export_json(rel_points, chara_rel, max_char_id):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
     print(f"✅ Exported definitions to {output_path}")
+
+
+def check_for_data_changes(current_rel_points, current_chara_rel):
+    """Check if affinity data has changed compared to previous run."""
+    path = "data/affinity_definitions.json"
+    if not os.path.exists(path):
+        return False
+        
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            prev_data = json.load(f)
+    except Exception:
+        return False
+        
+    print("   Checking for data changes in existing characters...")
+    
+    # Compare relation points
+    prev_rel_points = {int(k): v for k, v in prev_data.get('rel_points', {}).items()}
+    if prev_rel_points != current_rel_points:
+        print(f"   → Relation point values have changed")
+        return True
+        
+    # Compare character relations
+    prev_chara_rel = {int(k): set(v) for k, v in prev_data.get('chara_rel', {}).items()}
+    
+    for char_id, prev_rels in prev_chara_rel.items():
+        if char_id not in current_chara_rel:
+            print(f"   → Character {char_id} was removed")
+            return True
+            
+        curr_rels = current_chara_rel[char_id]
+        if prev_rels != curr_rels:
+            print(f"   → Relations changed for character {char_id}")
+            return True
+            
+    return False
 
 
 def main():
@@ -233,9 +263,14 @@ def main():
     if last_char:
         print(f"   → Last migration processed up to character {last_char}")
         
-        if last_char >= max_char_id:
+        data_changed = check_for_data_changes(rel_points, chara_rel)
+        
+        if last_char >= max_char_id and not data_changed:
             print(f"\n✅ Already up to date! No new characters to process.")
             return
+        
+        if data_changed:
+            print(f"   → ⚠️ Data changes detected! Forcing update.")
         
         # New characters are those with ID > last_char
         new_char_ids = list(range(last_char + 1, max_char_id + 1))
@@ -249,7 +284,7 @@ def main():
 
     # Compute all affinity scores
     print(f"\n📊 Computing affinity scores...")
-    affinity_data, race_affinity = compute_affinity_scores(rel_points, chara_rel, max_char_id)
+    affinity_data = compute_affinity_scores(rel_points, chara_rel, max_char_id)
 
     # Export JSON definitions for Node.js app
     print(f"\n📦 Exporting JSON definitions...")
@@ -292,13 +327,11 @@ def main():
         for (main, left, right), data in affinity_data.items():
             scores = data['affinity_scores']
             base = data['base_affinity']
-            race_aff = race_affinity.get((left, right), 0)
             
             array_str = 'ARRAY[' + ','.join(map(str, scores)) + ']::int[]'
             f.write(
                 f"UPDATE inheritance SET affinity_scores = {array_str}, "
-                f"base_affinity = {base}, "
-                f"race_affinity = {race_aff} "
+                f"base_affinity = {base} "
                 f"WHERE main_chara_id = {main} AND left_chara_id = {left} AND right_chara_id = {right};\n"
             )
             
@@ -310,7 +343,7 @@ def main():
         
         # ===== CREATE INDEXES =====
         f.write(f"-- Expression indexes for affinity sorting\n")
-        f.write(f"-- Note: DROP old indexes first, then CREATE new ones with race_affinity\n\n")
+        f.write(f"-- Note: DROP old indexes first, then CREATE new ones\n\n")
         
         if is_incremental:
             # Only create indexes for new character IDs that actually exist in the data
@@ -320,7 +353,7 @@ def main():
                     f.write(f"DROP INDEX IF EXISTS idx_inheritance_total_affinity_{char_id};\n")
                     f.write(
                         f"CREATE INDEX CONCURRENTLY idx_inheritance_total_affinity_{char_id} \n"
-                        f"    ON inheritance ((COALESCE(affinity_scores[{pg_index}], 0) + COALESCE(race_affinity, 0)) DESC);\n\n"
+                        f"    ON inheritance ((COALESCE(affinity_scores[{pg_index}], 0)) DESC);\n\n"
                     )
         else:
             # Recreate indexes for all characters that exist in the data
@@ -329,15 +362,13 @@ def main():
                 f.write(f"DROP INDEX IF EXISTS idx_inheritance_total_affinity_{char_id};\n")
                 f.write(
                     f"CREATE INDEX CONCURRENTLY idx_inheritance_total_affinity_{char_id} \n"
-                    f"    ON inheritance ((COALESCE(affinity_scores[{pg_index}], 0) + COALESCE(race_affinity, 0)) DESC);\n\n"
+                    f"    ON inheritance ((COALESCE(affinity_scores[{pg_index}], 0)) DESC);\n\n"
                 )
             
-            f.write("-- Default affinity index (base_affinity + race_affinity)\n")
+            f.write("-- Default affinity index (base_affinity)\n")
             f.write("DROP INDEX IF EXISTS idx_inheritance_default_affinity;\n")
             f.write("CREATE INDEX CONCURRENTLY idx_inheritance_default_affinity \n")
-            f.write("    ON inheritance ((COALESCE(base_affinity, 0) + COALESCE(race_affinity, 0)) DESC);\n\n")
-        
-        # f.write("COMMIT;\n\n")
+            f.write("    ON inheritance ((COALESCE(base_affinity, 0)) DESC);\n\n")
         
         f.write("-- Verify:\n")
         f.write(f"-- SELECT array_length(affinity_scores, 1) FROM inheritance LIMIT 1;  -- Should be {array_length}\n")

@@ -81,6 +81,9 @@ async fn main() -> anyhow::Result<()> {
     // Start background task to refresh materialized views every hour
     tokio::spawn(refresh_stats_task(pool.clone()));
 
+    // Start background task to refresh circle live ranks every 5 minutes
+    tokio::spawn(refresh_circle_ranks_task(pool.clone()));
+
     // Start background task to clean up expired cache entries every 10 minutes
     tokio::spawn(cache_cleanup_task());
 
@@ -249,6 +252,35 @@ async fn refresh_stats_task(pool: PgPool) {
                         "✅ Materialized view stats_counts refreshed successfully (non-concurrent)"
                     ),
                     Err(e) => warn!("⚠️ Failed to refresh stats_counts: {}", e),
+                }
+            }
+        }
+    }
+}
+
+// Background task to refresh circle live ranks materialized view
+async fn refresh_circle_ranks_task(pool: PgPool) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
+
+    info!("🔄 Starting circle ranks refresh background task (runs every 5 minutes)");
+
+    loop {
+        interval.tick().await;
+
+        // Try concurrent refresh first, fall back to regular refresh if needed
+        match sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY circle_live_ranks")
+            .execute(&pool)
+            .await
+        {
+            Ok(_) => info!("✅ Materialized view circle_live_ranks refreshed successfully"),
+            Err(_) => {
+                // Fall back to non-concurrent refresh
+                match sqlx::query("REFRESH MATERIALIZED VIEW circle_live_ranks")
+                    .execute(&pool)
+                    .await
+                {
+                    Ok(_) => info!("✅ circle_live_ranks refreshed (non-concurrent)"),
+                    Err(e) => warn!("⚠️ Failed to refresh circle_live_ranks: {}", e),
                 }
             }
         }

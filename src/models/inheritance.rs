@@ -22,5 +22,13 @@ pub struct Inheritance {
     pub main_white_factors: Vec<i32>,
     pub main_white_count: i32,
     #[sqlx(default)]
+    pub blue_stars_sum: i32,
+    #[sqlx(default)]
+    pub pink_stars_sum: i32,
+    #[sqlx(default)]
+    pub green_stars_sum: i32,
+    #[sqlx(default)]
+    pub white_stars_sum: i32,
+    #[sqlx(default)]
     pub affinity_score: Option<i32>,
 }

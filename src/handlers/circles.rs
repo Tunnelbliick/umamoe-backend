@@ -157,24 +157,13 @@ pub async fn list_circles(
 
     // Only calculate live ranks if we are NOT searching (or if explicitly requested)
     // For search queries, we can rely on stored monthly_rank to avoid expensive window functions
+    // Use materialized view for live ranks (much faster than computing on every query)
     let use_live_ranks = params.query.is_none();
 
     let mut with_parts = Vec::new();
 
-    if use_live_ranks {
-        with_parts.push(r#"
-            GlobalRanks AS (
-                SELECT 
-                    circle_id, 
-                    RANK() OVER (ORDER BY monthly_point DESC NULLS LAST) as live_rank,
-                    RANK() OVER (ORDER BY yesterday_points DESC NULLS LAST) as live_yesterday_rank
-                FROM circles
-                WHERE (archived IS NULL OR archived = false)
-                  AND last_updated >= date_trunc('month', CURRENT_DATE)
-                  AND last_updated < date_trunc('month', CURRENT_DATE) + interval '1 month'
-            )
-        "#.trim().to_string());
-    }
+    // Note: We now use the circle_live_ranks materialized view instead of computing ranks
+    // The view should be refreshed periodically (e.g., every 5 minutes)
 
     // If search query is present, add MatchingCircles CTE to optimize search
     let mut join_matching_circles = String::new();
@@ -204,8 +193,8 @@ pub async fn list_circles(
             SELECT cm.circle_id 
             FROM circle_member_fans_monthly cm 
             JOIN trainer tm ON cm.viewer_id::text = tm.account_id 
-            WHERE cm.year = extract(year from current_date)::int 
-              AND cm.month = extract(month from current_date)::int 
+            WHERE cm.year = extract(year from CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int 
+              AND cm.month = extract(month from CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int 
               AND tm.name ILIKE '{}'
             "#,
             search_pattern
@@ -224,8 +213,8 @@ pub async fn list_circles(
                 SELECT circle_id 
                 FROM circle_member_fans_monthly 
                 WHERE viewer_id = {} 
-                  AND year = extract(year from current_date)::int 
-                  AND month = extract(month from current_date)::int
+                  AND year = extract(year from CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int 
+                  AND month = extract(month from CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int
                 "#,
                 search_exact
             ));
@@ -243,8 +232,9 @@ pub async fn list_circles(
         format!("WITH {}", with_parts.join(", "))
     };
 
+    // Use materialized view instead of CTE for live ranks
     let join_global_ranks = if use_live_ranks {
-        "LEFT JOIN GlobalRanks gr ON c.circle_id = gr.circle_id"
+        "LEFT JOIN circle_live_ranks gr ON c.circle_id = gr.circle_id"
     } else {
         ""
     };
@@ -307,8 +297,8 @@ pub async fn list_circles(
     let mut conditions = Vec::new();
 
     // Only show circles updated this month to ensure points are current
-    conditions.push("c.last_updated >= date_trunc('month', CURRENT_DATE)".to_string());
-    conditions.push("c.last_updated < date_trunc('month', CURRENT_DATE) + interval '1 month'".to_string());
+    conditions.push("c.last_updated >= ((date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '12 hours') AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Europe/Berlin'".to_string());
+    conditions.push("c.last_updated < ((date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 month' + interval '12 hours') AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Europe/Berlin'".to_string());
     // Exclude archived circles
     conditions.push("(c.archived IS NULL OR c.archived = false)".to_string());
 
@@ -435,11 +425,12 @@ async fn fetch_circle_members(
     year: Option<i32>,
     month: Option<i32>,
 ) -> Result<Vec<CircleMemberFansMonthly>, AppError> {
-    use chrono::Datelike;
+    use chrono::{Datelike, FixedOffset, Utc};
     
-    // Default to current date if not provided
+    // Default to current date (JST) if not provided
     let (target_year, target_month) = if year.is_none() || month.is_none() {
-        let now = chrono::Local::now();
+        let jst_offset = FixedOffset::east_opt(9 * 3600).unwrap();
+        let now = Utc::now().with_timezone(&jst_offset);
         (
             year.unwrap_or(now.year()),
             month.unwrap_or(now.month() as i32)

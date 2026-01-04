@@ -61,6 +61,25 @@ pub struct UnifiedSearchParams {
     pub min_win_count: Option<i32>,
     #[serde(default)]
     pub min_white_count: Option<i32>,
+
+    // Star sum filtering
+    #[serde(default)]
+    pub min_blue_stars_sum: Option<i32>,
+    #[serde(default)]
+    pub max_blue_stars_sum: Option<i32>,
+    #[serde(default)]
+    pub min_pink_stars_sum: Option<i32>,
+    #[serde(default)]
+    pub max_pink_stars_sum: Option<i32>,
+    #[serde(default)]
+    pub min_green_stars_sum: Option<i32>,
+    #[serde(default)]
+    pub max_green_stars_sum: Option<i32>,
+    #[serde(default)]
+    pub min_white_stars_sum: Option<i32>,
+    #[serde(default)]
+    pub max_white_stars_sum: Option<i32>,
+
     // Main inherit filtering
     #[serde(default)]
     pub min_main_blue_factors: Option<i32>,
