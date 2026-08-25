@@ -9,9 +9,11 @@
 //!      result into `partner_inheritance`.
 //!   3. Frontend opens an SSE connection at
 //!      `/api/v4/partner/lookup/{task_id}/stream` and waits for completion.
-//!   4. Bot worker fetches data from the game API, writes the inheritance
-//!      row, and updates the task to `completed`. The Postgres trigger fires
-//!      a NOTIFY → backend's listener fans out → SSE delivers the result.
+//!   4. Bot worker fetches data from the game API and writes the normalized
+//!      result to the temporary task row. Authenticated results are also saved
+//!      to `partner_inheritance`; anonymous results are delivered only by SSE.
+//!      The Postgres trigger fires a NOTIFY and the backend also reconciles the
+//!      task row until it can deliver the terminal result.
 //!
 //! Logged-in users additionally have `GET /saved` to list previously fetched
 //! partners ordered by `updated_at DESC`, `DELETE /saved/id/{id}` to remove one
@@ -44,6 +46,9 @@ use crate::models::{
 use crate::AppState;
 
 const TASK_TYPE: &str = "practice_race/get_partner_info";
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(120);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const ANONYMOUS_TASK_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -55,36 +60,23 @@ pub fn router() -> Router<AppState> {
         .route("/saved/migrate", post(migrate_anon))
 }
 
-fn direct_result_from_completed_task(task_data: &serde_json::Value) -> Option<PartnerDirectResult> {
-    let result = task_data.get("result")?;
-    let inheritance = result
-        .get("inheritance")
-        .cloned()
-        .unwrap_or_else(|| result.clone());
-    let account_id = inheritance
-        .get("account_id")
-        .or_else(|| result.get("account_id"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let trainer_name = inheritance
-        .get("trainer_name")
-        .or_else(|| result.get("trainer_name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let follower_num = inheritance
-        .get("follower_num")
-        .or_else(|| result.get("follower_num"))
-        .and_then(|v| v.as_i64())
-        .and_then(|n| i32::try_from(n).ok());
+fn completion_status(status: &str, task_data: &serde_json::Value) -> Option<&'static str> {
+    match status {
+        "completed" => Some("completed"),
+        "failed" => Some("failed"),
+        // The worker writes the anonymous result before its terminal status.
+        // Treat that committed payload as authoritative so a failed/missed
+        // status update or NOTIFY cannot strand the SSE stream.
+        _ if task_data.get("result").is_some() => Some("completed"),
+        _ => None,
+    }
+}
 
-    Some(PartnerDirectResult {
-        account_id,
-        trainer_name,
-        follower_num,
-        last_updated: None,
-        inheritance: Some(inheritance),
-    })
+fn is_anonymous_lookup(task_data: &serde_json::Value) -> bool {
+    task_data
+        .get("user_id")
+        .and_then(|value| value.as_str())
+        .is_none_or(|user_id| user_id.trim().is_empty())
 }
 
 /// Queue a partner lookup task. Returns a task id that the client uses to
@@ -160,37 +152,6 @@ async fn create_lookup(
         }
     }
 
-    if lookup_kind == "practice_partner" && !will_persist {
-        let cached_task_data: Option<serde_json::Value> = sqlx::query_scalar(
-            r#"
-            SELECT task_data
-            FROM tasks
-            WHERE task_type = $1
-              AND status = 'completed'
-              AND task_data->>'partner_id' = $2
-              AND task_data->'result' IS NOT NULL
-            ORDER BY updated_at DESC NULLS LAST, created_at DESC, id DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(TASK_TYPE)
-        .bind(&partner_id)
-        .fetch_optional(&state.db)
-        .await?;
-
-        if let Some(record) = cached_task_data
-            .as_ref()
-            .and_then(direct_result_from_completed_task)
-        {
-            return Ok(Json(PartnerLookupResponse {
-                task_id: None,
-                status: "completed".into(),
-                will_persist: false,
-                result: Some(record),
-            }));
-        }
-    }
-
     if state.user_writes_disabled {
         return Err(AppError::Forbidden(
             "Partner lookups that need a new task are disabled in this read-only environment"
@@ -236,7 +197,7 @@ async fn stream_lookup(
             .fetch_optional(&state.db)
             .await?;
 
-    let (task_type, current_status, _) =
+    let (task_type, current_status, current_task_data) =
         existing.ok_or_else(|| AppError::NotFound(format!("Task {task_id} not found")))?;
 
     if task_type != TASK_TYPE {
@@ -250,9 +211,10 @@ async fn stream_lookup(
         ReceiverStream::new(rx)
     }
 
-    // If already terminal, emit immediately and close.
-    if current_status == "completed" || current_status == "failed" {
-        let evt = build_completion_event(&state, task_id, &current_status).await;
+    // If already terminal (or the worker committed a result before its final
+    // status update), emit immediately and close.
+    if let Some(status) = completion_status(&current_status, &current_task_data) {
+        let evt = build_terminal_event(&state, task_id, status).await;
         return Ok(Sse::new(one_shot(evt).await).keep_alive(KeepAlive::default()));
     }
 
@@ -262,14 +224,15 @@ async fn stream_lookup(
 
     // Re-check status after subscribing in case the worker completed while
     // we were setting up.
-    let status_now: Option<String> = sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1")
-        .bind(task_id)
-        .fetch_optional(&state.db)
-        .await?;
+    let state_now: Option<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT status, task_data FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(&state.db)
+            .await?;
 
-    if let Some(s) = status_now.as_deref() {
-        if s == "completed" || s == "failed" {
-            let evt = build_completion_event(&state, task_id, s).await;
+    if let Some((status, task_data)) = state_now {
+        if let Some(status) = completion_status(&status, &task_data) {
+            let evt = build_terminal_event(&state, task_id, status).await;
             return Ok(Sse::new(one_shot(evt).await).keep_alive(KeepAlive::default()));
         }
     }
@@ -279,7 +242,8 @@ async fn stream_lookup(
     // Build a stream that:
     //   1. Emits a `pending` event right away so the client knows the
     //      connection is live.
-    //   2. Awaits the broadcast notification (with a generous timeout).
+    //   2. Awaits broadcast notifications while periodically reconciling the
+    //      database state, so a dropped NOTIFY cannot strand the request.
     //   3. Loads + emits the result, then closes.
     let pending_evt = Event::default()
         .event("pending")
@@ -296,43 +260,40 @@ async fn stream_lookup(
 
     let mut broadcast_rx = rx;
     tokio::spawn(async move {
-        // Hard deadline — 2 minutes total. We loop inside handling intermediate
-        // `processing` events so the frontend can transition its UI state.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                // Timed out — delete the stale task so it doesn't linger in
-                // the queue and get retried endlessly.
-                if !state_clone.user_writes_disabled {
-                    let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
-                        .bind(task_id)
-                        .execute(&state_clone.db)
-                        .await;
+                // Always reconcile once more before declaring a timeout. The
+                // terminal NOTIFY may have been lost while the listener was
+                // reconnecting.
+                if let Some(status) = reconciled_completion_status(&state_clone, task_id).await {
+                    let evt = build_terminal_event(&state_clone, task_id, &status).await;
+                    let _ = tx.send(Ok(evt)).await;
+                } else {
+                    let evt = build_timeout_event(&state_clone, task_id).await;
+                    let _ = tx.send(Ok(evt)).await;
                 }
-                let _ = tx
-                    .send(Ok(Event::default().event("timeout").data(
-                        json!({ "task_id": task_id, "status": "timeout" }).to_string(),
-                    )))
-                    .await;
                 break;
             }
 
-            let outcome = tokio::time::timeout(remaining, broadcast_rx.recv()).await;
-            match outcome {
-                Ok(Ok(notification)) => {
+            let poll_after = remaining.min(RECONCILE_INTERVAL);
+            tokio::select! {
+                outcome = broadcast_rx.recv() => match outcome {
+                    Ok(notification) => {
                     if notification.status == "processing" {
-                        // Intermediate event: bot picked up the task. Emit and
-                        // keep the loop going — we still need the final result.
-                        let _ = tx
+                        if tx
                             .send(Ok(Event::default().event("processing").data(
                                 json!({ "task_id": task_id, "status": "processing" }).to_string(),
                             )))
-                            .await;
-                    } else {
-                        // Terminal (completed / failed).
-                        let evt = build_completion_event(
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    } else if matches!(notification.status.as_str(), "completed" | "failed") {
+                        let evt = build_terminal_event(
                             &state_clone,
                             notification.task_id,
                             &notification.status,
@@ -341,36 +302,24 @@ async fn stream_lookup(
                         let _ = tx.send(Ok(evt)).await;
                         break;
                     }
-                }
-                Ok(Err(_)) => {
-                    // Sender dropped without firing — fall back to a DB read.
-                    let s: Option<String> =
-                        sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1")
-                            .bind(task_id)
-                            .fetch_optional(&state_clone.db)
-                            .await
-                            .ok()
-                            .flatten();
-                    let status = s.unwrap_or_else(|| "failed".to_string());
-                    let evt = build_completion_event(&state_clone, task_id, &status).await;
-                    let _ = tx.send(Ok(evt)).await;
-                    break;
-                }
-                Err(_) => {
-                    // Timed out — delete the stale task so it doesn't linger in
-                    // the queue and get retried endlessly.
-                    if !state_clone.user_writes_disabled {
-                        let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
-                            .bind(task_id)
-                            .execute(&state_clone.db)
-                            .await;
                     }
-                    let _ = tx
-                        .send(Ok(Event::default().event("timeout").data(
-                            json!({ "task_id": task_id, "status": "timeout" }).to_string(),
-                        )))
-                        .await;
-                    break;
+                    Err(_) => {
+                        if let Some(status) = reconciled_completion_status(&state_clone, task_id).await {
+                            let evt = build_terminal_event(&state_clone, task_id, &status).await;
+                            let _ = tx.send(Ok(evt)).await;
+                            break;
+                        }
+                        // A closed/lagged local channel is recoverable because
+                        // the database remains the source of truth.
+                        broadcast_rx = state_clone.task_notifier.subscribe(task_id).await;
+                    }
+                },
+                _ = tokio::time::sleep(poll_after) => {
+                    if let Some(status) = reconciled_completion_status(&state_clone, task_id).await {
+                        let evt = build_terminal_event(&state_clone, task_id, &status).await;
+                        let _ = tx.send(Ok(evt)).await;
+                        break;
+                    }
                 }
             }
         }
@@ -381,7 +330,73 @@ async fn stream_lookup(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-async fn build_completion_event(state: &AppState, task_id: i32, status: &str) -> Event {
+async fn reconciled_completion_status(state: &AppState, task_id: i32) -> Option<String> {
+    let row: Result<Option<(String, serde_json::Value)>, sqlx::Error> =
+        sqlx::query_as("SELECT status, task_data FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(&state.db)
+            .await;
+
+    match row {
+        Ok(Some((status, task_data))) => completion_status(&status, &task_data).map(str::to_string),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(task_id, %error, "Failed to reconcile partner lookup task");
+            None
+        }
+    }
+}
+
+async fn build_timeout_event(state: &AppState, task_id: i32) -> Event {
+    if !state.user_writes_disabled {
+        let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .execute(&state.db)
+            .await;
+    }
+
+    Event::default()
+        .event("timeout")
+        .data(json!({ "task_id": task_id, "status": "timeout" }).to_string())
+}
+
+struct BuiltCompletionEvent {
+    event: Event,
+    anonymous: bool,
+}
+
+async fn build_terminal_event(state: &AppState, task_id: i32, status: &str) -> Event {
+    let built = build_completion_event(state, task_id, status).await;
+    if built.anonymous && !state.user_writes_disabled {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            // Give concurrently connected SSE clients time to read the same
+            // result, then remove the anonymous transport row. Anonymous
+            // lookups are never promoted to saved partner history.
+            tokio::time::sleep(ANONYMOUS_TASK_CLEANUP_DELAY).await;
+            let _ = sqlx::query(
+                r#"
+                DELETE FROM tasks
+                WHERE id = $1
+                  AND task_type = $2
+                  AND task_data->>'user_id' IS NULL
+                  AND (status IN ('completed', 'failed') OR task_data ? 'result')
+                "#,
+            )
+            .bind(task_id)
+            .bind(TASK_TYPE)
+            .execute(&db)
+            .await;
+        });
+    }
+    built.event
+}
+
+async fn build_completion_event(
+    state: &AppState,
+    task_id: i32,
+    status: &str,
+) -> BuiltCompletionEvent {
     // Pull task row to get task_data (which the bot may stash a `result`
     // payload into — used for anonymous lookups that have no DB row).
     let row: Option<(serde_json::Value, Option<String>)> =
@@ -392,6 +407,10 @@ async fn build_completion_event(state: &AppState, task_id: i32, status: &str) ->
             .ok()
             .flatten();
 
+    let anonymous = row
+        .as_ref()
+        .map(|(task_data, _)| is_anonymous_lookup(task_data))
+        .unwrap_or(false);
     let (task_data, error_message) = row.unwrap_or((serde_json::Value::Null, None));
     let task_result = task_data.get("result");
     let task_inheritance = task_result
@@ -468,11 +487,15 @@ async fn build_completion_event(state: &AppState, task_id: i32, status: &str) ->
         _ => "update",
     };
 
-    Event::default().event(event_name).data(payload.to_string())
+    BuiltCompletionEvent {
+        event: Event::default().event(event_name).data(payload.to_string()),
+        anonymous,
+    }
 }
 
 /// List all partner inheritances saved by the authenticated user.
-/// Returns an empty list for unauthenticated users (data is stored locally).
+/// Returns an empty list for unauthenticated users; their lookup result is
+/// delivered only through the task's SSE stream.
 async fn list_saved(
     State(state): State<AppState>,
     OptionalUser(user): OptionalUser,
@@ -641,6 +664,44 @@ async fn migrate_anon(
 
 #[cfg(test)]
 mod tests {
+    use super::{completion_status, is_anonymous_lookup};
+
+    #[test]
+    fn committed_result_is_terminal_even_before_status_update() {
+        let task_data = serde_json::json!({
+            "partner_id": "123456789",
+            "user_id": null,
+            "result": { "account_id": "123456789012" }
+        });
+
+        assert_eq!(
+            completion_status("processing", &task_data),
+            Some("completed")
+        );
+        assert_eq!(completion_status("pending", &task_data), Some("completed"));
+        assert_eq!(completion_status("failed", &task_data), Some("failed"));
+    }
+
+    #[test]
+    fn active_task_without_result_is_not_terminal() {
+        let task_data = serde_json::json!({
+            "partner_id": "123456789",
+            "user_id": null
+        });
+
+        assert_eq!(completion_status("pending", &task_data), None);
+        assert_eq!(completion_status("processing", &task_data), None);
+    }
+
+    #[test]
+    fn anonymous_lookup_has_no_usable_user_id() {
+        assert!(is_anonymous_lookup(&serde_json::json!({ "user_id": null })));
+        assert!(is_anonymous_lookup(&serde_json::json!({})));
+        assert!(!is_anonymous_lookup(&serde_json::json!({
+            "user_id": "83d8a8f0-a1a1-4d9f-b7a8-c5f650ba27d6"
+        })));
+    }
+
     #[test]
     fn partner_lookup_task_creation_is_idempotent() {
         let source = include_str!("partner.rs");
