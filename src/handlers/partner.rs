@@ -46,7 +46,6 @@ use crate::models::{
 use crate::AppState;
 
 const TASK_TYPE: &str = "practice_race/get_partner_info";
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const ANONYMOUS_TASK_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
@@ -260,26 +259,13 @@ async fn stream_lookup(
 
     let mut broadcast_rx = rx;
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
-
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                // Always reconcile once more before declaring a timeout. The
-                // terminal NOTIFY may have been lost while the listener was
-                // reconnecting.
-                if let Some(status) = reconciled_completion_status(&state_clone, task_id).await {
-                    let evt = build_terminal_event(&state_clone, task_id, &status).await;
-                    let _ = tx.send(Ok(evt)).await;
-                } else {
-                    let evt = build_timeout_event(&state_clone, task_id).await;
-                    let _ = tx.send(Ok(evt)).await;
-                }
-                break;
-            }
-
-            let poll_after = remaining.min(RECONCILE_INTERVAL);
             tokio::select! {
+                // A lookup can legitimately stay processing while it waits in
+                // the workers' hot queue. Keep the anonymous task row and SSE
+                // result channel alive until the worker reaches a terminal
+                // state. Stop the reconciler promptly if the browser leaves.
+                _ = tx.closed() => break,
                 outcome = broadcast_rx.recv() => match outcome {
                     Ok(notification) => {
                     if notification.status == "processing" {
@@ -314,7 +300,7 @@ async fn stream_lookup(
                         broadcast_rx = state_clone.task_notifier.subscribe(task_id).await;
                     }
                 },
-                _ = tokio::time::sleep(poll_after) => {
+                _ = tokio::time::sleep(RECONCILE_INTERVAL) => {
                     if let Some(status) = reconciled_completion_status(&state_clone, task_id).await {
                         let evt = build_terminal_event(&state_clone, task_id, &status).await;
                         let _ = tx.send(Ok(evt)).await;
@@ -345,19 +331,6 @@ async fn reconciled_completion_status(state: &AppState, task_id: i32) -> Option<
             None
         }
     }
-}
-
-async fn build_timeout_event(state: &AppState, task_id: i32) -> Event {
-    if !state.user_writes_disabled {
-        let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
-            .bind(task_id)
-            .execute(&state.db)
-            .await;
-    }
-
-    Event::default()
-        .event("timeout")
-        .data(json!({ "task_id": task_id, "status": "timeout" }).to_string())
 }
 
 struct BuiltCompletionEvent {
@@ -714,5 +687,20 @@ mod tests {
         assert!(create_block.contains("insert_or_get_active_task("));
         assert!(!create_block.contains("fix_task_sequence"));
         assert!(!create_block.contains("INSERT INTO tasks"));
+    }
+
+    #[test]
+    fn active_partner_stream_has_no_destructive_timeout() {
+        let source = include_str!("partner.rs");
+        let stream_block = source
+            .split("async fn stream_lookup(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn reconciled_completion_status(").next())
+            .expect("partner lookup stream block should exist");
+
+        assert!(stream_block.contains("tx.closed()"));
+        assert!(!stream_block.contains("LOOKUP_TIMEOUT"));
+        assert!(!stream_block.contains("build_timeout_event"));
+        assert!(!stream_block.contains("DELETE FROM tasks"));
     }
 }
