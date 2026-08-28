@@ -65,8 +65,12 @@ fn completion_status(status: &str, task_data: &serde_json::Value) -> Option<&'st
         "failed" => Some("failed"),
         // The worker writes the anonymous result before its terminal status.
         // Treat that committed payload as authoritative so a failed/missed
-        // status update or NOTIFY cannot strand the SSE stream.
-        _ if task_data.get("result").is_some() => Some("completed"),
+        // status update or NOTIFY cannot strand the SSE stream. Authenticated
+        // lookups must still wait for their saved row to commit before the
+        // stream reports completion.
+        _ if is_anonymous_lookup(task_data) && task_data.get("result").is_some() => {
+            Some("completed")
+        }
         _ => None,
     }
 }
@@ -653,6 +657,22 @@ mod tests {
         );
         assert_eq!(completion_status("pending", &task_data), Some("completed"));
         assert_eq!(completion_status("failed", &task_data), Some("failed"));
+    }
+
+    #[test]
+    fn authenticated_result_waits_for_persistence_to_complete() {
+        let task_data = serde_json::json!({
+            "partner_id": "123456789",
+            "user_id": "83d8a8f0-a1a1-4d9f-b7a8-c5f650ba27d6",
+            "result": { "account_id": "123456789012" }
+        });
+
+        assert_eq!(completion_status("pending", &task_data), None);
+        assert_eq!(completion_status("processing", &task_data), None);
+        assert_eq!(
+            completion_status("completed", &task_data),
+            Some("completed")
+        );
     }
 
     #[test]
