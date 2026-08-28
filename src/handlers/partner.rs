@@ -109,9 +109,16 @@ async fn create_lookup(
     let user_id_str = user.as_ref().map(|u| u.user_id.to_string());
     let will_persist = user_id_str.is_some();
 
-    // For trainer IDs (12 digits) check our DB first — no need to queue a
-    // bot task if we already have fresh inheritance data.
-    if lookup_kind == "trainer" {
+    if payload.require_persistence && !will_persist {
+        return Err(AppError::Unauthorized(
+            "Your session is missing or expired; sign in again to save this partner lookup".into(),
+        ));
+    }
+
+    // Anonymous trainer-ID lookups may use a cached direct result. Signed-in
+    // lookups must go through the worker so completion means the result was
+    // actually written to partner_inheritance and will survive a reload.
+    if lookup_kind == "trainer" && !will_persist {
         #[derive(sqlx::FromRow)]
         struct TrainerRow {
             trainer_name: String,
@@ -471,16 +478,12 @@ async fn build_completion_event(
 }
 
 /// List all partner inheritances saved by the authenticated user.
-/// Returns an empty list for unauthenticated users; their lookup result is
-/// delivered only through the task's SSE stream.
+/// Authentication failures are returned to the client rather than being
+/// disguised as an empty saved-history list.
 async fn list_saved(
     State(state): State<AppState>,
-    OptionalUser(user): OptionalUser,
+    user: AuthenticatedUser,
 ) -> Result<Json<Vec<PartnerInheritance>>, AppError> {
-    let Some(user) = user else {
-        return Ok(Json(vec![]));
-    };
-
     let rows = sqlx::query_as::<_, PartnerInheritance>(
         "SELECT * FROM partner_inheritance WHERE user_id = $1 ORDER BY updated_at DESC",
     )
@@ -642,6 +645,25 @@ async fn migrate_anon(
 #[cfg(test)]
 mod tests {
     use super::{completion_status, is_anonymous_lookup};
+    use crate::models::PartnerLookupRequest;
+
+    #[test]
+    fn persistence_requirement_is_backwards_compatible_and_explicit() {
+        let anonymous: PartnerLookupRequest = serde_json::from_value(serde_json::json!({
+            "partner_id": "123456789",
+            "label": null
+        }))
+        .expect("legacy anonymous request should deserialize");
+        let signed_in: PartnerLookupRequest = serde_json::from_value(serde_json::json!({
+            "partner_id": "123456789",
+            "label": null,
+            "require_persistence": true
+        }))
+        .expect("persistence-required request should deserialize");
+
+        assert!(!anonymous.require_persistence);
+        assert!(signed_in.require_persistence);
+    }
 
     #[test]
     fn committed_result_is_terminal_even_before_status_update() {
@@ -707,6 +729,34 @@ mod tests {
         assert!(create_block.contains("insert_or_get_active_task("));
         assert!(!create_block.contains("fix_task_sequence"));
         assert!(!create_block.contains("INSERT INTO tasks"));
+    }
+
+    #[test]
+    fn signed_in_lookups_cannot_take_non_persistent_fallbacks() {
+        let source = include_str!("partner.rs");
+        let create_block = source
+            .split("async fn create_lookup(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn stream_lookup(").next())
+            .expect("partner lookup creation block should exist");
+
+        assert!(create_block.contains("payload.require_persistence && !will_persist"));
+        assert!(create_block.contains("AppError::Unauthorized"));
+        assert!(create_block.contains("lookup_kind == \"trainer\" && !will_persist"));
+    }
+
+    #[test]
+    fn saved_history_requires_authentication() {
+        let source = include_str!("partner.rs");
+        let list_block = source
+            .split("async fn list_saved(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn delete_saved_by_id(").next())
+            .expect("saved-history block should exist");
+
+        assert!(list_block.contains("user: AuthenticatedUser"));
+        assert!(!list_block.contains("OptionalUser"));
+        assert!(!list_block.contains("Ok(Json(vec![]))"));
     }
 
     #[test]

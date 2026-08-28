@@ -151,6 +151,11 @@ pub struct PartnerLookupRequest {
     /// the entry later in their saved list.
     #[validate(length(max = 64))]
     pub label: Option<String>,
+    /// When true, reject the request unless it is authenticated. This keeps a
+    /// client that expects a saved lookup from silently falling back to the
+    /// anonymous, non-persistent path when its session is missing or expired.
+    #[serde(default)]
+    pub require_persistence: bool,
 }
 
 /// Slim result returned when a trainer ID is found directly in our DB.
