@@ -252,6 +252,7 @@ jobs:
           database_acquire_timeout_seconds="${16}"
           router_name="${container_name}-router"
           router_config="$(dirname "$compose_file")/${container_name}.nginx.conf"
+          publift_networks_file="$(dirname "$compose_file")/publift-site-check-networks.txt"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -322,6 +323,15 @@ jobs:
             -e DATABASE_MIN_CONNECTIONS="$database_min_connections"
             -e DATABASE_ACQUIRE_TIMEOUT_SECONDS="$database_acquire_timeout_seconds"
           )
+
+          if [ -f "$publift_networks_file" ]; then
+            docker_args+=(
+              --mount
+              "type=bind,source=$publift_networks_file,target=/run/secrets/publift-site-check-networks,readonly"
+            )
+          else
+            echo "Publift site-check network file not found at $publift_networks_file; exception disabled." >&2
+          fi
 
           docker run "${docker_args[@]}" "$image_tag"
 
@@ -579,6 +589,7 @@ jobs:
           database_acquire_timeout_seconds="${16}"
           router_name="${container_name}-router"
           router_config="$(dirname "$compose_file")/${container_name}.nginx.conf"
+          publift_networks_file="$(dirname "$compose_file")/publift-site-check-networks.txt"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -649,6 +660,15 @@ jobs:
             -e DATABASE_MIN_CONNECTIONS="$database_min_connections"
             -e DATABASE_ACQUIRE_TIMEOUT_SECONDS="$database_acquire_timeout_seconds"
           )
+
+          if [ -f "$publift_networks_file" ]; then
+            docker_args+=(
+              --mount
+              "type=bind,source=$publift_networks_file,target=/run/secrets/publift-site-check-networks,readonly"
+            )
+          else
+            echo "Publift site-check network file not found at $publift_networks_file; exception disabled." >&2
+          fi
 
           docker run "${docker_args[@]}" "$image_tag"
 

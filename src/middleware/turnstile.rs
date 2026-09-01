@@ -14,7 +14,8 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    net::SocketAddr,
+    fs,
+    net::{IpAddr, SocketAddr},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -33,9 +34,13 @@ const BROWSER_PROOF_AUDIENCE: &str = "uma-api";
 const BROWSER_PROOF_TYPE: &str = "browser_proof";
 const BROWSER_PROOF_SOURCE_TURNSTILE: &str = "turnstile";
 const BROWSER_PROOF_SOURCE_WARMUP: &str = "warmup";
+const BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER: &str = "trusted_crawler";
 const DEFAULT_TURNSTILE_ACTION: &str = "api_request";
+const PUBLIFT_SITE_CHECK_NETWORKS_FILE_ENV: &str = "PUBLIFT_SITE_CHECK_NETWORKS_FILE";
+const DEFAULT_PUBLIFT_SITE_CHECK_NETWORKS_FILE: &str = "/run/secrets/publift-site-check-networks";
 
 static RATE_LIMITS: OnceLock<DashMap<String, RateWindow>> = OnceLock::new();
+static PUBLIFT_SITE_CHECK_NETWORKS: OnceLock<Vec<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct RateWindow {
@@ -309,7 +314,7 @@ async fn authorize_browser_request(
     if let Some(proof) = extract_browser_proof(&headers) {
         match verify_browser_proof(proof, state.redis_store.as_ref()).await {
             Ok(claims) => {
-                if claims.source == BROWSER_PROOF_SOURCE_WARMUP
+                if is_read_only_browser_proof_source(&claims.source)
                     && *method != Method::GET
                     && *method != Method::HEAD
                 {
@@ -354,6 +359,40 @@ async fn authorize_browser_request(
                 ));
             }
         }
+    }
+
+    if is_publift_site_check_request(method, headers, client_ip) {
+        let issued_proof = match issue_browser_proof(
+            headers,
+            state.redis_store.as_ref(),
+            BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER,
+            None,
+        )
+        .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                error!(
+                    "Failed to issue trusted crawler browser proof from ip {} on {}: {}",
+                    client_ip, path, error
+                );
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "browser_proof_unavailable",
+                ));
+            }
+        };
+
+        info!(
+            "Issued trusted crawler browser proof for {} from ip {} on {}",
+            issued_proof.subject, client_ip, path
+        );
+        return Ok(BrowserAuthorization {
+            credential: "trusted_crawler",
+            subject: Some(issued_proof.subject.clone()),
+            proof_source: Some(issued_proof.source.to_string()),
+            issued_proof: Some(issued_proof),
+        });
     }
 
     if let Some(turnstile_token) = extract_turnstile_token(&headers) {
@@ -631,6 +670,42 @@ pub async fn issue_internal_browser_proof(
         return json_error(StatusCode::FORBIDDEN, "browser_context_required");
     }
 
+    if is_publift_site_check_ip(&browser_client_ip) {
+        let proof = match issue_browser_proof(
+            &headers,
+            state.redis_store.as_ref(),
+            BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER,
+            None,
+        )
+        .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                error!(
+                    "Failed to issue internal trusted crawler proof for browser ip {} via service ip {}: {}",
+                    browser_client_ip, client_ip, error
+                );
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "browser_proof_unavailable");
+            }
+        };
+
+        info!(
+            "Issued internal trusted crawler proof for {} from browser ip {} via service ip {}",
+            proof.subject, browser_client_ip, client_ip
+        );
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        return match attach_browser_proof(&mut response, &proof) {
+            Ok(()) => response,
+            Err(error) => {
+                error!("Failed to attach internal trusted crawler proof: {}", error);
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "browser_proof_unavailable",
+                )
+            }
+        };
+    }
+
     let warmup_marker = match reserve_warmup_bootstrap(
         &headers,
         state.redis_store.as_ref(),
@@ -835,7 +910,7 @@ pub async fn verify_internal_credential(
     if let Some(proof) = extract_browser_proof(&headers) {
         match verify_browser_proof(proof, state.redis_store.as_ref()).await {
             Ok(claims) => {
-                if claims.source == BROWSER_PROOF_SOURCE_WARMUP
+                if is_read_only_browser_proof_source(&claims.source)
                     && context.method != "GET"
                     && context.method != "HEAD"
                 {
@@ -1092,7 +1167,7 @@ fn attach_browser_proof(response: &mut Response, proof: &IssuedBrowserProof) -> 
     let headers = response.headers_mut();
     headers.insert(BROWSER_PROOF_SOURCE_HEADER, source_value);
 
-    if proof.source == BROWSER_PROOF_SOURCE_TURNSTILE {
+    if is_full_browser_proof_source(proof.source) {
         let ttl_value =
             HeaderValue::from_str(&proof.ttl_seconds.to_string()).map_err(|e| e.to_string())?;
         let cookie = browser_proof_cookie(&proof.token);
@@ -1243,9 +1318,7 @@ fn validate_browser_proof_claims(claims: BrowserProofClaims) -> Result<BrowserPr
     if !allowed_turnstile_host(&claims.host) {
         return Err("wrong proof host".to_string());
     }
-    if claims.source != BROWSER_PROOF_SOURCE_TURNSTILE
-        && claims.source != BROWSER_PROOF_SOURCE_WARMUP
-    {
+    if !is_supported_browser_proof_source(&claims.source) {
         return Err("wrong proof source".to_string());
     }
     let now = chrono::Utc::now().timestamp() as usize;
@@ -1446,6 +1519,111 @@ fn can_bootstrap_browser_read(method: &Method, headers: &HeaderMap) -> bool {
     }
 
     has_allowed_browser_context(headers)
+}
+
+fn is_publift_site_check_request(method: &Method, headers: &HeaderMap, client_ip: &str) -> bool {
+    is_safe_browser_read(method, headers) && is_publift_site_check_ip(client_ip)
+}
+
+fn is_safe_browser_read(method: &Method, headers: &HeaderMap) -> bool {
+    (*method == Method::GET || *method == Method::HEAD) && has_allowed_browser_context(headers)
+}
+
+fn is_publift_site_check_ip(client_ip: &str) -> bool {
+    let Ok(client_ip) = client_ip.trim().parse::<IpAddr>() else {
+        return false;
+    };
+
+    publift_site_check_networks()
+        .iter()
+        .any(|network| ip_matches_network(client_ip, network))
+}
+
+fn publift_site_check_networks() -> &'static [String] {
+    PUBLIFT_SITE_CHECK_NETWORKS
+        .get_or_init(|| {
+            let path = env_string(PUBLIFT_SITE_CHECK_NETWORKS_FILE_ENV)
+                .unwrap_or_else(|| DEFAULT_PUBLIFT_SITE_CHECK_NETWORKS_FILE.to_string());
+            let value = match fs::read_to_string(&path) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "Could not read Publift site-check network file {}: {}; proof exceptions are disabled",
+                        path, error
+                    );
+                    return Vec::new();
+                }
+            };
+            let networks = parse_network_list(&value);
+
+            if networks.is_empty() {
+                warn!(
+                    "Publift site-check network file {} is empty; proof exceptions are disabled",
+                    path
+                );
+            } else {
+                info!(
+                    "Configured {} Publift site-check network entries",
+                    networks.len()
+                );
+            }
+
+            networks
+        })
+        .as_slice()
+}
+
+fn parse_network_list(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| character == ',' || character == ';' || character.is_whitespace())
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn ip_matches_network(client_ip: IpAddr, network: &str) -> bool {
+    let Some((network_address, prefix_length)) = network.split_once('/') else {
+        return network.parse::<IpAddr>().ok() == Some(client_ip);
+    };
+    let Ok(network_address) = network_address.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix_length) = prefix_length.parse::<u32>() else {
+        return false;
+    };
+
+    match (client_ip, network_address) {
+        (IpAddr::V4(client), IpAddr::V4(network)) if prefix_length <= 32 => {
+            let mask = if prefix_length == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_length)
+            };
+            u32::from(client) & mask == u32::from(network) & mask
+        }
+        (IpAddr::V6(client), IpAddr::V6(network)) if prefix_length <= 128 => {
+            let mask = if prefix_length == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_length)
+            };
+            u128::from(client) & mask == u128::from(network) & mask
+        }
+        _ => false,
+    }
+}
+
+fn is_full_browser_proof_source(source: &str) -> bool {
+    source == BROWSER_PROOF_SOURCE_TURNSTILE || source == BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER
+}
+
+fn is_read_only_browser_proof_source(source: &str) -> bool {
+    source == BROWSER_PROOF_SOURCE_WARMUP || source == BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER
+}
+
+fn is_supported_browser_proof_source(source: &str) -> bool {
+    is_full_browser_proof_source(source) || source == BROWSER_PROOF_SOURCE_WARMUP
 }
 
 fn has_allowed_browser_context(headers: &HeaderMap) -> bool {
@@ -1870,4 +2048,68 @@ fn rate_limited(retry_after: u64) -> Response {
         response.headers_mut().insert(RETRY_AFTER, value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_secret_accepts_common_delimiters() {
+        assert_eq!(
+            parse_network_list("192.0.2.0/24,198.51.100.7; 2001:db8::/32\n203.0.113.8"),
+            vec![
+                "192.0.2.0/24",
+                "198.51.100.7",
+                "2001:db8::/32",
+                "203.0.113.8",
+            ]
+        );
+    }
+
+    #[test]
+    fn cidr_matching_respects_network_boundaries() {
+        let network = "192.0.2.0/25";
+        assert!(ip_matches_network("192.0.2.0".parse().unwrap(), network));
+        assert!(ip_matches_network("192.0.2.127".parse().unwrap(), network));
+        assert!(!ip_matches_network("192.0.2.128".parse().unwrap(), network));
+        assert!(!ip_matches_network("192.0.1.255".parse().unwrap(), network));
+        assert!(ip_matches_network(
+            "2001:db8::1234".parse().unwrap(),
+            "2001:db8::/32"
+        ));
+        assert!(!ip_matches_network(
+            "2001:db9::1".parse().unwrap(),
+            "2001:db8::/32"
+        ));
+    }
+
+    #[test]
+    fn publift_exception_requires_a_safe_browser_request() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Origin", HeaderValue::from_static("https://uma.moe"));
+
+        assert!(is_safe_browser_read(&Method::GET, &headers));
+        assert!(is_safe_browser_read(&Method::HEAD, &headers));
+        assert!(!is_safe_browser_read(&Method::POST, &headers));
+
+        headers.insert(
+            "Origin",
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        assert!(!is_safe_browser_read(&Method::GET, &headers));
+    }
+
+    #[test]
+    fn trusted_crawler_proofs_are_full_but_read_only() {
+        assert!(is_full_browser_proof_source(
+            BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER
+        ));
+        assert!(is_read_only_browser_proof_source(
+            BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER
+        ));
+        assert!(is_supported_browser_proof_source(
+            BROWSER_PROOF_SOURCE_TRUSTED_CRAWLER
+        ));
+    }
 }
