@@ -264,6 +264,14 @@ jobs:
             exit 1
           fi
 
+          if [ ! -e "$publift_networks_file" ]; then
+            (umask 022; : > "$publift_networks_file")
+            echo "Created empty Publift site-check network file at $publift_networks_file."
+          elif [ ! -f "$publift_networks_file" ]; then
+            echo "Publift site-check network path is not a regular file: $publift_networks_file" >&2
+            exit 1
+          fi
+
           if ! docker compose version >/dev/null 2>&1; then
             echo "Docker Compose v2 is required to manage the shared Redis container." >&2
             exit 1
@@ -598,6 +606,14 @@ jobs:
 
           if [ ! -f "$compose_file" ]; then
             echo "Missing backend compose file: $compose_file" >&2
+            exit 1
+          fi
+
+          if [ ! -e "$publift_networks_file" ]; then
+            (umask 022; : > "$publift_networks_file")
+            echo "Created empty Publift site-check network file at $publift_networks_file."
+          elif [ ! -f "$publift_networks_file" ]; then
+            echo "Publift site-check network path is not a regular file: $publift_networks_file" >&2
             exit 1
           fi
 
